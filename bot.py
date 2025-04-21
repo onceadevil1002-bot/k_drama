@@ -30,7 +30,7 @@ DATA_FILE = "data.json"
 if not os.path.exists(DATA_FILE):
     with open(DATA_FILE, "w") as f:
         json.dump({}, f)
-        
+
 def load_data():
     with open(DATA_FILE) as f:
         data = json.load(f)
