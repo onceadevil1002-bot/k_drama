@@ -4,7 +4,6 @@ import json
 import asyncio
 from urllib.parse import unquote
 from pyrogram import Client, filters
-from dotenv import load_dotenv
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -16,7 +15,6 @@ def slugify_show_name(name: str) -> str:
     return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
 
 
-load_dotenv()  # 👈 This line loads your .env file
 # === Load Environment Variables ===
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
