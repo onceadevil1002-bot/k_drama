@@ -16,12 +16,13 @@ def slugify_show_name(name: str) -> str:
 
 
 # === Load Environment Variables ===
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
-MAIN_CHANNEL_LINK = os.getenv("MAIN_CHANNEL_LINK")
-STORAGE_CHANNEL_id = os.getenv("STORAGE_CHANNEL_id")
+API_ID=25916987
+API_HASH="ae252401c519461df086a9a80adff4b8"
+BOT_TOKEN="8093776997:AAFGuDYAwROq5GkwiAcKWMksq4lXl1YxMBc"
+ADMIN_ID=6244759828
+MAIN_CHANNEL_LINK="https://t.me/KDRAMAAVIL"
+STORAGE_CHANNEL_id="@anudram"  
+
 
 app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
