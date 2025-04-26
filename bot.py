@@ -26,13 +26,11 @@ STORAGE_CHANNEL_id="@anudram"
 
 app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-from pymongo import MongoClient
-
 # === MongoDB Database ===
 MONGO_URI = "mongodb+srv://kdrama_bot:shows@cluster0.7i4xnv0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
 client = MongoClient(MONGO_URI)
-db = client['kdrama_bot']  # your database
-collection = db['shows']   # your collection
+db = client['kdrama']  # <-- YOUR DATABASE NAME
+collection = db['shows']        # <-- YOUR COLLECTION NAME
 
 def load_data():
     data = {}
