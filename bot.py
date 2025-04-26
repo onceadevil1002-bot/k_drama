@@ -1,6 +1,6 @@
 import os
 import re
-import json
+from pymongo import MongoClient
 import asyncio
 from urllib.parse import unquote
 from pyrogram import Client, filters
@@ -26,34 +26,32 @@ STORAGE_CHANNEL_id="@anudram"
 
 app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# === JSON Database ===
-DATA_FILE = "data.json"
-if not os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "w") as f:
-        json.dump({}, f)
+from pymongo import MongoClient
+
+# === MongoDB Database ===
+MONGO_URI = "mongodb+srv://kdrama_bot:shows@cluster0.7i4xnv0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+client = MongoClient(MONGO_URI)
+db = client['kdrama_bot']  # your database
+collection = db['shows']   # your collection
 
 def load_data():
-    with open(DATA_FILE) as f:
-        data = json.load(f)
-    return {slugify_show_name(name): value for name, value in data.items()}
+    data = {}
+    for doc in collection.find():
+        show_name = doc['show_name']
+        episodes = doc['episodes']
+        data[show_name] = episodes
+    return data
 
 def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    collection.delete_many({})
+    for show_name, episodes in data.items():
+        collection.insert_one({
+            "show_name": show_name,
+            "episodes": episodes
+        })
 
 # === Global State ===
 upload_state = {}  # user_id: {"show": show_name, "season": season_number}
-
-# === Commands ===
-
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram import filters
-import json
-
-# Load data from JSON
-def load_data():
-    with open("data.json", "r", encoding="utf-8") as f:
-        return json.load(f)
 
 # Constants
 MAIN_CHANNEL_LINK = "https://t.me/KDRAMAAVIL"  # Replace with your main channel
