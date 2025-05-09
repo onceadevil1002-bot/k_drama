@@ -11,9 +11,6 @@ from pyrogram.types import (
     CallbackQuery,
 )
 
-def slugify_show_name(name: str) -> str:
-    return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
-
 
 # === Load Environment Variables ===
 API_ID=25916987
@@ -32,21 +29,30 @@ client = MongoClient(MONGO_URI)
 db = client['kdrama']  # <-- YOUR DATABASE NAME
 collection = db['shows']        # <-- YOUR COLLECTION NAME
 
+# Load data grouped by category
 def load_data():
-    data = {}
+    data = {"Hindi Dubbed": {}, "Regional": {}}
     for doc in collection.find():
-        show_name = doc['show_name']
-        episodes = doc['episodes']
-        data[show_name] = episodes
+        category = doc.get("category", "Hindi Dubbed")  # default fallback
+        show_name = doc["show_name"]
+        episodes = doc["episodes"]
+        if category not in data:
+            data[category] = {}
+        data[category][show_name] = episodes
     return data
 
 def save_data(data):
     collection.delete_many({})
-    for show_name, episodes in data.items():
-        collection.insert_one({
-            "show_name": show_name,
-            "episodes": episodes
-        })
+    for category, shows in data.items():
+        for show_name, episodes in shows.items():
+            collection.insert_one({
+                "category": category,
+                "show_name": show_name,
+                "episodes": episodes
+            })
+
+def slugify_show_name(name: str) -> str:
+    return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
 
 # === Global State ===
 upload_state = {}  # user_id: {"show": show_name, "season": season_number}
@@ -54,167 +60,248 @@ upload_state = {}  # user_id: {"show": show_name, "season": season_number}
 # Constants
 MAIN_CHANNEL_LINK = "https://t.me/KDRAMAAVIL"  # Replace with your main channel
 
+# One-time migration (run once to assign category to old shows)
+def migrate_category():
+    collection.update_many({"category": {"$exists": False}}, {"$set": {"category": "Hindi Dubbed"}})
+
+# Call it once in main
+migrate_category()
+
+MAIN_CHANNEL_LINK = "https://t.me/KDRAMAAVIL"
+ADMIN_ID = 6244759828
+
+app = Client("kdrama_bot")
+from urllib.parse import unquote
+
+joined_users = set()  # In-memory per-session; use DB for permanent join tracking
+
+from urllib.parse import unquote
+
 @app.on_message(filters.command("start"))
-async def start(client, message):
-    args = message.text.split(maxsplit=1)
+async def start(client, message: Message):
+    user_id = message.from_user.id
     data = load_data()
+    args = message.text.split()
+    slug = args[1] if len(args) > 1 else None
 
-    # If no slug or show name is passed, show the main interface with show list
-    if len(args) == 1:
-        user_buttons = [
+    # Force join check
+    if not slug and user_id not in joined_users:
+        keyboard = [
             [InlineKeyboardButton("📣 Join Main Channel", url=MAIN_CHANNEL_LINK)],
-            [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")],
+            [InlineKeyboardButton("✅ I Joined", callback_data="joined")]
         ]
-        for show_name in data.keys():
-            user_buttons.append([InlineKeyboardButton(show_name, callback_data=f"show_{show_name}")])
-        await message.reply("🎬 **Welcome to K-Drama Bot!**\nChoose a show below:", reply_markup=InlineKeyboardMarkup(user_buttons))
-        return
+        return await message.reply("🔒 Please join our channel to use the bot.", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # Handle both slugs and direct show names
-    param = args[1].strip()
-
-    # Case 1: Slug-based redirection (e.g., /start sweet_home)
-    if param.replace("_", " ") not in data:  # Check if it's a slug
-        show_name_requested = param.replace("_", " ").strip()
-        show_data = data.get(show_name_requested)
-
-        if not show_data:
-            # Highlight the corresponding show button on the main interface
-            user_buttons = [
-                [InlineKeyboardButton("📣 Join Main Channel", url=MAIN_CHANNEL_LINK)],
-                [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")],
-            ]
-            for name in data.keys():
-                if name.lower().replace(" ", "_") == param:
-                    user_buttons.append([InlineKeyboardButton(f"🌟 {name}", callback_data=f"show_{name}")])
-                else:
-                    user_buttons.append([InlineKeyboardButton(name, callback_data=f"show_{name}")])
-
-            await message.reply(
-                f"🎬 **Welcome to K-Drama Bot!**\nHighlighted: **{param.replace('_', ' ')}**",
-                reply_markup=InlineKeyboardMarkup(user_buttons)
-            )
-            return
-
-    # Case 2: Direct show name passed (e.g., /start Sweet_Home)
-    show_name_requested = param.replace("_", " ").strip()
-    show_data = data.get(show_name_requested)
-
-    if not show_data:
-        await message.reply("❌ Show not found.")
-        return
-
-    # Redirect user to the main show button
-    show_buttons = [
-        [InlineKeyboardButton("📣 Join Main Channel", url=MAIN_CHANNEL_LINK)],
-        [InlineKeyboardButton(show_name_requested, callback_data=f"show_{show_name_requested}")]
-    ]
-    await message.reply(
-        f"📺 Show: **{show_name_requested}**\nTap below to open the show.",
-        reply_markup=InlineKeyboardMarkup(show_buttons)
-    )
-@app.on_message(filters.command("add") & filters.user(ADMIN_ID))
-async def add_show(client, message):
-    parts = message.text.split(" ", 1)
-    if len(parts) < 2:
-        await message.reply("❗ Usage: /add Show Name or /add Show Name SeasonNumber")
-        return
-
-    args = parts[1].strip()
-    if not args:
-        await message.reply("❗ Invalid input.")
-        return
-
-    data = load_data()
-    arg_parts = args.rsplit(" ", 1)  # split only at last space
-
-    if arg_parts[-1].isdigit():  # It's a season add
-        show_name = arg_parts[0].strip()
-        season_number = arg_parts[1].strip()
-
-        if show_name not in data:
-            await message.reply("❗ Show not found. Use /add Show Name first.")
-            return
-        if season_number in data[show_name]:
-            await message.reply("⚠️ Season already exists!")
-            return
-
-        data[show_name][season_number] = []
-        save_data(data)
-        await message.reply(f"✅ Added season: {season_number} under *{show_name}*")
-
-    else:  # It's a new show
-        show_name = args
-        if show_name in data:
-            await message.reply("⚠️ Show already exists!")
-            return
-        data[show_name] = {}
-        save_data(data)
-        await message.reply(f"✅ Added show: *{show_name}*")
-
-
-# ===== FIXED /upload COMMAND =====@app.on_message(filters.command("upload") & filters.user(ADMIN_ID))
-@app.on_message(filters.command("upload") & filters.user(ADMIN_ID))
-async def upload(client, message: Message):
-    parts = message.text.split(" ", 1)
-    if len(parts) < 2:
-        return await message.reply("❗ Usage: /upload Show Name or /upload Show Name > season season1")
-
-    args = parts[1].strip()
-    if not args:
-        return await message.reply("❗ Invalid show name or season.")
-
-    # Check for new format: Show Name > season season1
-    if ">" in args and "season" in args.lower():
+    # Slug handling: Format => Hindi_Dubbed__Sweet_Home
+    if slug and "__" in slug:
         try:
-            show_part, season_part = args.split(">", 1)
-            show_part = show_part.strip()
-            season_number = season_part.strip().lower().replace("season", "").strip()
-        except ValueError:
-            return await message.reply("❗ Invalid format. Use /upload ShowName > season season1")
+            category_part, show_part = slug.split("__", 1)
+            category = category_part.replace("_", " ").title().strip()
+            show_name = show_part.replace("_", " ").strip()
+        except:
+            return await message.reply("❌ Invalid link format.")
 
-        data = load_data()
-        matched_show = None
-        for show in data:
-            if show == show_part:
-                matched_show = show
-                break
+        if category not in data or show_name not in data[category]:
+            return await message.reply("❌ Show not found.")
 
-        if not matched_show:
-            return await message.reply("❗ Show not found. Use /add Show Name first.")
+        buttons = [[InlineKeyboardButton(f"⭐ {show_name}", callback_data=f"show_{category}_{show_name}")]]
+        for s in sorted(data[category]):
+            if s != show_name:
+                emoji = "🎞" if category == "Hindi Dubbed" else "🌍"
+                buttons.append([InlineKeyboardButton(f"{emoji} {s}", callback_data=f"show_{category}_{s}")])
 
-        if season_number not in data[matched_show]:
-            return await message.reply("❗ Season not found. Use /add Show Name SeasonNumber first.")
+        title = "🎞 Hindi Dubbed Shows:" if category == "Hindi Dubbed" else "🌍 Regional Shows:"
+        joined_users.add(user_id)
+        return await message.reply(title, reply_markup=InlineKeyboardMarkup(buttons))
 
-        upload_state[message.from_user.id] = {"show": matched_show, "season": season_number}
-        return await message.reply(f"📤 Send videos now for *{matched_show}* Season *{season_number}*", quote=True)
+    # Fallback: default main menu
+    joined_users.add(user_id)
+    keyboard = [
+        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
+        [InlineKeyboardButton("🌐 Regional", callback_data="category_regional")],
+        [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
+    ]
+    return await message.reply("🎬 Welcome to K-Drama Bot! Choose a category:", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # Legacy format: /upload ShowName or /upload ShowName season1
+
+@app.on_callback_query(filters.regex("^category_hindi$"))
+async def category_hindi(client, callback):
     data = load_data()
+    if "Hindi Dubbed" not in data:
+        return await callback.answer("❌ No shows found.")
+    buttons = [
+        [InlineKeyboardButton(f"🎞 {show}", callback_data=f"show_Hindi Dubbed_{show}")]
+        for show in sorted(data["Hindi Dubbed"])
+    ]
+    await callback.message.edit("🎞 Hindi Dubbed Shows:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+@app.on_callback_query(filters.regex("^category_regional$"))
+async def category_regional(client, callback):
+    data = load_data()
+    if "Regional" not in data:
+        return await callback.answer("❌ No shows found.")
+    buttons = [
+        [InlineKeyboardButton(f"🌍 {show}", callback_data=f"show_Regional_{show}")]
+        for show in sorted(data["Regional"])
+    ]
+    await callback.message.edit("🌍 Regional Shows:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+
+@app.on_callback_query(filters.regex("^joined$"))
+async def joined_channel(client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    joined_users.add(user_id)
+
+    keyboard = [
+        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
+        [InlineKeyboardButton("🌐 Regional", callback_data="category_regional")],
+        [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
+    ]
+    await callback.message.edit("🎬 Welcome to K-Drama Bot! Choose a category:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+# ✅ Combined Add Show/Season Handler
+@app.on_message(filters.command(["add", "add_hindi", "add_regional"]) & filters.user(ADMIN_ID))
+async def add_show(client, message):
+    cmd = message.command[0]
+    if len(message.command) < 2:
+        return await message.reply(
+            "❗ Usage:\n"
+            "/add Show Name\n"
+            "/add Show Name > Category\n"
+            "/add Show Name 1\n"
+            "/add Show Name > Category 1"
+        )
+
+    args = message.text.split(" ", 1)[1].strip()
+    category = "Hindi Dubbed"  # default
     show_name = None
     season_number = None
 
-    for name in data.keys():
-        if args.startswith(name):
-            remainder = args[len(name):].strip()
-            show_name = name
-            if remainder.lower().startswith("season"):
-                season_number = remainder.lower().replace("season", "").strip()
-            elif remainder.isdigit():
-                season_number = remainder
-            break
+    if cmd == "add_hindi":
+        category = "Hindi Dubbed"
+    elif cmd == "add_regional":
+        category = "Regional"
 
-    if not show_name:
-        return await message.reply("❗ Show not found. Use /add Show Name first.")
+    # Check if category is included
+    if ">" in args:
+        try:
+            show_part, rest = args.split(">", 1)
+            show_part = show_part.strip()
+            rest = rest.strip().split()
 
+            show_name = show_part
+            if rest and rest[-1].isdigit():
+                season_number = rest[-1]
+                category = " ".join(rest[:-1]).title() if len(rest) > 1 else category
+            else:
+                category = " ".join(rest).title()
+        except:
+            return await message.reply("❗ Invalid format. Use /add Show Name > Category 1")
+    else:
+        # Check for season number directly at the end
+        parts = args.rsplit(" ", 1)
+        if parts[-1].isdigit():
+            show_name = parts[0].strip()
+            season_number = parts[1].strip()
+        else:
+            show_name = args.strip()
+
+    data = load_data()
+
+    # Ensure category structure exists
+    if category not in data:
+        data[category] = {}
+
+    # If show doesn't exist, add it
+    if show_name not in data[category]:
+        data[category][show_name] = {"episodes": []}
+        await message.reply(f"✅ Added show: *{show_name}* under *{category}*")
+
+    # If season is provided, add it to the show
     if season_number:
-        if season_number not in data[show_name]:
-            return await message.reply("❗ Season not found. Use /add Show Name SeasonNumber first.")
-        upload_state[message.from_user.id] = {"show": show_name, "season": season_number}
+        if season_number in data[category][show_name]:
+            return await message.reply("⚠️ Season already exists.")
+        data[category][show_name][season_number] = []
+        await message.reply(f"✅ Added *Season {season_number}* under *{show_name}*")
+
+    save_data(data)
+
+@app.on_message(filters.command(["upload", "upload_hindi", "upload_regional"]) & filters.user(ADMIN_ID))
+async def upload_handler(client, message: Message):
+    cmd = message.command[0]
+    if len(message.command) < 2:
+        return await message.reply("❗ Usage:\n"
+                                   "/upload Show Name\n"
+                                   "/upload Show Name 1\n"
+                                   "/upload Show Name > Category\n"
+                                   "/upload Show Name > Category 2")
+
+    args = message.text.split(" ", 1)[1].strip()
+    data = load_data()
+
+    category = "Hindi Dubbed"
+    show_name = None
+    season_number = None
+
+    # Detect shortcut commands
+    if cmd == "upload_hindi":
+        category = "Hindi Dubbed"
+    elif cmd == "upload_regional":
+        category = "Regional"
+
+    # Handle '>' category format
+    if ">" in args:
+        try:
+            show_part, rest = args.split(">", 1)
+            show_part = show_part.strip()
+            rest = rest.strip().split()
+
+            show_name = show_part
+            if rest and rest[-1].isdigit():
+                season_number = rest[-1]
+                category = " ".join(rest[:-1]).title() if len(rest) > 1 else category
+            else:
+                category = " ".join(rest).title()
+        except:
+            return await message.reply("❗ Invalid format. Use /upload Show Name > Category 1")
+    else:
+        # Handle legacy: Show Name 1
+        parts = args.rsplit(" ", 1)
+        if parts[-1].isdigit():
+            show_name = parts[0].strip()
+            season_number = parts[1].strip()
+        else:
+            show_name = args.strip()
+
+    if category not in data or show_name not in data[category]:
+        return await message.reply("❗ Show not found. Use /add command first.")
+
+    # 🔐 Split Safety Check
+    if season_number:
+        if season_number not in data[category][show_name]:
+            return await message.reply("❗ Season not found. Use /add to create it first.")
+        episodes = data[category][show_name][season_number]
+        if episodes and isinstance(episodes[-1], list):
+            return await message.reply("⚠️ Last episode appears split. Use /upload_split to upload parts safely.")
+        upload_state[message.from_user.id] = {
+            "show": show_name,
+            "season": season_number,
+            "category": category
+        }
         return await message.reply(f"📤 Send videos now for *{show_name}* Season *{season_number}*", quote=True)
     else:
-        upload_state[message.from_user.id] = {"show": show_name, "season": None}
+        flat_eps = data[category][show_name]["episodes"]
+        if flat_eps and isinstance(flat_eps[-1], list):
+            return await message.reply("⚠️ Last episode appears split. Use /upload_split to upload parts safely.")
+        upload_state[message.from_user.id] = {
+            "show": show_name,
+            "season": None,
+            "category": category
+        }
         return await message.reply(f"📤 Send videos now for *{show_name}*", quote=True)
+
 
 
 # ===== FIXED VIDEO SAVING =====
@@ -227,6 +314,7 @@ async def handle_video(client, message: Message):
     state = upload_state[user_id]
     show_name = state["show"]
     season_number = state["season"]
+    category = state["category"]
 
     try:
         # ✅ Forward to storage channel
@@ -236,12 +324,30 @@ async def handle_video(client, message: Message):
         # ✅ NEW: delete from storage channel to keep chat invisible
         await fwd.delete()
 
-        # ✅ Save to DB
+        # ✅ Save to MongoDB in correct category path
         data = load_data()
+
+        if "split_index" in state:
+            # 🔥 Uploading to a split episode
+            split_index = state["split_index"]
+            part = state["part"]
+
+            episodes = data[category][show_name][season_number]
+            if not isinstance(episodes[split_index], list):
+                return await message.reply("❌ Target episode is not split. Use /split_episode first.")
+
+            # Ensure list has space for two parts
+            while len(episodes[split_index]) <= part:
+                episodes[split_index].append(None)
+
+            episodes[split_index][part] = file_id
+            save_data(data)
+            return await message.reply(f"✅ Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
+
         if season_number:
-            data.setdefault(show_name, {}).setdefault(season_number, []).append(file_id)
+            data[category][show_name].setdefault(season_number, []).append(file_id)
         else:
-            data.setdefault(show_name, {}).setdefault("episodes", []).append(file_id)
+            data[category][show_name].setdefault("episodes", []).append(file_id)
 
         save_data(data)
 
@@ -253,21 +359,71 @@ async def handle_video(client, message: Message):
     except Exception as e:
         print("Upload error:", e)
         await message.reply("❌ Failed to upload. Please check bot permissions or channel ID.")
+@app.on_callback_query(filters.regex("^multi_"))
+async def multi_part_episode_menu(client, callback: CallbackQuery):
+    try:
+        _, category, show_name, season_or_key, index = callback.data.split("_", 4)
+        index = int(index) - 1
+        data = load_data()
+
+        multi_parts = data[category][show_name][season_or_key][index]
+        if not isinstance(multi_parts, list) or len(multi_parts) != 2:
+            return await callback.answer("⚠️ Multi-part not found.")
+
+        buttons = [
+            [InlineKeyboardButton("▶️ Episode", callback_data=f"mp_ep_{category}_{show_name}_{season_or_key}_{index}_0")],
+            [InlineKeyboardButton("▶️ Episode .5", callback_data=f"mp_ep_{category}_{show_name}_{season_or_key}_{index}_1")]
+        ]
+
+        await callback.message.edit(
+            f"🎬 Parts for Episode {index + 1}",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    except Exception as e:
+        print("Multi-part submenu error:", e)
+        await callback.answer("❌ Error showing split parts.")
+
+@app.on_callback_query(filters.regex("^mp_ep_"))
+async def send_multi_part_episode(client, callback: CallbackQuery):
+    try:
+        _, category, show_name, season_or_key, index_str, part_str = callback.data.split("_", 5)
+        index = int(index_str)
+        part = int(part_str)
+        data = load_data()
+
+        file_id = data[category][show_name][season_or_key][index][part]
+        caption = f"🎬 {show_name} - Episode {index + 1}{'.5' if part == 1 else ''}"
+        sent = await client.send_video(chat_id=callback.from_user.id, video=file_id, caption=caption)
+
+        await callback.answer("✅ Sent! Auto-delete in 3 mins.")
+        await asyncio.sleep(180)
+        await sent.delete()
+
+    except Exception as e:
+        print("Multi-part send error:", e)
+        await callback.answer("❌ Couldn't send episode.")
 
 
 
-@app.on_callback_query(filters.regex("^season_(.+)"))
-async def season_menu(client, callback_query: CallbackQuery):
-    show_name, season_number = callback_query.data.split("_")[1:]
+
+@app.on_callback_query(filters.regex("^season_(.+?)_(.+?)_(.+)$"))
+async def season_menu(client, callback_query):
+    category, show_name, season_number = callback_query.data.split("_", 3)[1:]
     data = load_data()
 
-    if show_name not in data or season_number not in data[show_name]:
+    if show_name not in data.get(category, {}) or season_number not in data[category][show_name]:
         await callback_query.answer("Season not found.")
         return
 
     buttons = []
-    for idx, file_id in enumerate(data[show_name][season_number], start=1):
-        buttons.append([InlineKeyboardButton(f"Episode {idx}", callback_data=f"episode_{show_name}_{season_number}_{idx}")])
+    for idx, file_id in enumerate(data[category][show_name][season_number], start=1):
+        buttons.append([
+            InlineKeyboardButton(
+                f"Episode {idx}",
+                callback_data=f"episode_{category}_{show_name}_{season_number}_{idx}"
+            )
+        ])
 
     await callback_query.message.edit(
         f"🎬 {show_name} - Season {season_number}",
@@ -275,28 +431,38 @@ async def season_menu(client, callback_query: CallbackQuery):
     )
 
 
-@app.on_callback_query(filters.regex("^show_(.+)"))
-async def show_menu(client, callback_query: CallbackQuery):
-    show_name = callback_query.data.split("_", 1)[1]
+@app.on_callback_query(filters.regex("^show_(.+?)_(.+)$"))
+async def show_menu(client, callback_query):
+    category, show_name = callback_query.data.split("_", 2)[1:]
     data = load_data()
 
-    if show_name not in data:
+    if show_name not in data.get(category, {}):
         await callback_query.answer("Show not found.")
         return
 
     buttons = []
+    episodes = data[category][show_name]
 
-    # ✅ Handle if episodes directly exist (no seasons)
-    if "episodes" in data[show_name]:
-        for idx, file_id in enumerate(data[show_name]["episodes"], start=1):
-            buttons.append([InlineKeyboardButton(f"Episode {idx}", callback_data=f"episode_{show_name}_episodes_{idx}")])
+    # Handle flat episodes
+    if "episodes" in episodes:
+        for idx, ep in enumerate(episodes["episodes"], start=1):
+            if isinstance(ep, list) and len(ep) == 2:
+                # Split episode with two parts
+                buttons.append([
+                    InlineKeyboardButton(f"📁 Episode {idx} (split)", callback_data=f"multi_{category}_{show_name}_episodes_{idx}")
+                ])
+            else:
+                buttons.append([
+                    InlineKeyboardButton(f"Episode {idx}", callback_data=f"episode_{category}_{show_name}_episodes_{idx}")
+                ])
 
-    # ✅ Handle all seasons
-    for season in data[show_name]:
+    # Handle seasons
+    for season in episodes:
         if season != "episodes":
-            buttons.append([InlineKeyboardButton(f"📁 Season {season}", callback_data=f"season_{show_name}_{season}")])
+            buttons.append([
+                InlineKeyboardButton(f"📁 Season {season}", callback_data=f"season_{category}_{show_name}_{season}")
+            ])
 
-    # ✅ Handle no content case
     if not buttons:
         buttons.append([InlineKeyboardButton("🚫 No videos uploaded yet", callback_data="noop")])
 
@@ -305,26 +471,117 @@ async def show_menu(client, callback_query: CallbackQuery):
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
+
+
+@app.on_message(filters.command("split_episode") & filters.user(ADMIN_ID))
+async def split_episode_command(client, message: Message):
+    if len(message.command) < 2:
+        return await message.reply(
+            "❗ Usage:\n"
+            "/split_episode Show Name /Episode > Category\n"
+            "/split_episode Show Name Season /Episode > Category"
+        )
+
+    try:
+        args = message.text.split(" ", 1)[1].strip()
+        if ">" not in args or "/" not in args:
+            return await message.reply("❗ Format must include '/' for episode and '>' for category")
+
+        show_and_season_part, right_part = args.split(">", 1)
+        show_parts = show_and_season_part.strip().split("/")
+        category = right_part.strip().title()
+
+        episode_num = int(show_parts[1].strip())  # like /6 → 6
+        episode_index = episode_num - 1
+
+        show_tokens = show_parts[0].strip().split()
+        show_name = " ".join(show_tokens[:-1]) if show_tokens[-1].isdigit() else " ".join(show_tokens)
+        season_number = show_tokens[-1] if show_tokens[-1].isdigit() else None
+
+        data = load_data()
+
+        if category not in data or show_name not in data[category]:
+            return await message.reply("❌ Show not found.")
+
+        if season_number:  # season-based
+            if season_number not in data[category][show_name]:
+                return await message.reply("❌ Season not found.")
+
+            episodes = data[category][show_name][season_number]
+        else:  # flat
+            if "episodes" not in data[category][show_name]:
+                return await message.reply("❌ No flat episodes found in this show.")
+            episodes = data[category][show_name]["episodes"]
+
+        if episode_index < 0 or episode_index >= len(episodes):
+            return await message.reply("❌ Episode index out of range.")
+
+        original = episodes[episode_index]
+        if isinstance(original, list):
+            return await message.reply("⚠️ Episode is already split.")
+
+        # Convert to [part1, None]
+        episodes[episode_index] = [original, None]
+        save_data(data)
+
+        ep_label = f"{episode_num}" if not season_number else f"{episode_num} (Season {season_number})"
+        return await message.reply(f"✅ Episode {ep_label} is now split into {episode_num} and {episode_num}.5")
+
+    except Exception as e:
+        print("[split_episode] error:", e)
+        return await message.reply("❌ Failed to process split command.")
+
+
+
+@app.on_message(filters.command("upload_split") & filters.user(ADMIN_ID))
+async def upload_split(client, message: Message):
+    try:
+        args = message.text.split(" ", 1)[1]
+        show_part, rest = args.split(">", 1)
+        show_name = show_part.strip()
+        parts = rest.strip().split()
+        if len(parts) != 4:
+            raise ValueError
+
+        category = parts[0].title()
+        season = parts[1]
+        episode = int(parts[2])
+        part_index = int(parts[3])  # 1 or 2
+
+        if part_index not in (1, 2):
+            return await message.reply("❌ Part must be 1 or 2.")
+
+        data = load_data()
+
+        if category not in data or show_name not in data[category]:
+            return await message.reply("❌ Show not found.")
+        if season not in data[category][show_name]:
+            return await message.reply("❌ Season not found.")
+        episodes = data[category][show_name][season]
+
+        if episode < 1 or episode > len(episodes):
+            return await message.reply("❌ Episode index out of range.")
+
+        if not isinstance(episodes[episode - 1], list):
+            return await message.reply("❌ Episode not split. Use /split_episode first.")
+
+        upload_state[message.from_user.id] = {
+            "show": show_name,
+            "season": season,
+            "category": category,
+            "split_index": episode - 1,
+            "part": part_index - 1  # for Python index
+        }
+
+        await message.reply(f"📤 Send video for *{show_name}* Season {season} Episode {episode} Part {part_index}")
+    except:
+        await message.reply("❗ Usage:\n/upload_split Show > Category Season EpisodeIndex Part")
+
+
+
 @app.on_callback_query(filters.regex("^noop$"))
 async def do_nothing(client, callback_query: CallbackQuery):
     await callback_query.answer("Nothing to show here.")
-
-
-@app.on_callback_query(filters.regex("^episode_(.+)"))
-async def send_episode(client, callback_query: CallbackQuery):
-    show_name, season_number, episode_index = callback_query.data.split("_")[1:]
-    episode_index = int(episode_index) - 1
-    data = load_data()
-
-    if show_name not in data or season_number not in data[show_name] or episode_index >= len(data[show_name][season_number]):
-        await callback_query.answer("Episode not found.")
-        return
-
-    file_id = data[show_name][season_number][episode_index]
-    sent_message = await client.send_video(callback_query.from_user.id, file_id, caption=f"🎬 {show_name} - Season {season_number} - Episode {episode_index + 1}")
-    await callback_query.answer("✅ Sent video. It will auto-delete in 3 minutes.")
-    await asyncio.sleep(180)
-    await sent_message.delete()
 
 
 @app.on_callback_query(filters.regex("^report$"))
@@ -368,25 +625,27 @@ async def list_content(client, message):
 
 
 from urllib.parse import quote  # Add at top if not already imported
+
+from urllib.parse import quote
+
 @app.on_message(filters.command("get_links") & filters.user(ADMIN_ID))
 async def get_links(client, message):
     data = load_data()
-
     if not data:
-        await message.reply("❌ No shows found.")
-        return
+        return await message.reply("❌ No shows found.")
 
+    bot_username = (await client.get_me()).username
     links = []
-    bot_username = (await client.get_me()).username  # Dynamically fetch bot username
 
-    for show_name in data.keys():
-        # Generate a consistent slug (lowercase with underscores)
-        slug = quote(show_name.lower().replace(" ", "_"))
-        link = f"https://t.me/{bot_username}?start={slug}"
-        links.append(f"🔗 **{show_name}**: [Click to View]({link})")
+    for category in data:
+        for show_name in data[category]:
+            # Format: Hindi_Dubbed__Sweet_Home
+            slug = f"{category.replace(' ', '_')}__{show_name.replace(' ', '_')}"
+            link = f"https://t.me/{bot_username}?start={slug}"
+            links.append(f"🔗 [{show_name} ({category})]({link})")
 
     await message.reply(
-        "**Here are the show links:**\n\n" + "\n".join(links),
+        "**🎬 Direct Show Links:**\n\n" + "\n".join(links),
         disable_web_page_preview=True
     )
 
@@ -395,135 +654,212 @@ async def help_command(client, message):
     if message.from_user.id == ADMIN_ID:
         help_text = """
 Admin Help:
-- /add ShowName: Add a new show.
-- /add Show Name: for new show buttons.
-- /add ShowName SeasonNumber: Add a new season.
-- /upload SweetHome:✅ Uploads to whole show
-- /upload Sweet Home:✅ Uploads to whole show (with spaces)
-- /upload SweetHome 2:✅ Uploads to Season 2
-- /upload Sweet Home 2:✅ Uploads to Season 2 (with spaces)
-- /upload Show Name > season season:✅ New format now supported
-- /delete SweetHome:✅ deletes full show (old format)
-- /delete Sweet Home:✅ deletes full show (new format)
-- /delete SweetHome 2:✅ deletes season 2
-- /delete Sweet Home 2:✅ deletes season 2
-- /delete SweetHome 2 3:✅ deletes episode 3 of season 2
-- /delete Sweet Home 2 3:✅ deletes episode 3 of season 2
-- /delete Show Name/4:Deletes episode 4 under the flat show (not season)
-- /list: List all shows, seasons, and episodes.
+🛠️ Add Commands:
+-/add Show Name 1 → Adds Season 1 (as number only) to an existing show
+-/add Show Name > Category 2 → Adds Season 2 under a category
+-/add Show Name → Adds show to default "Hindi Dubbed"
+-/add Show Name > Regional → Adds show to "Regional"
+-/add_hindi and /add_regional also supported
+📤 Upload:
+-/upload Show Name:Upload flat episodes (Hindi Dubbed)
+-/upload Show Name 1:Upload to Season 1
+-/upload Show Name > Regional:Upload flat episodes under Regional
+-/upload Show Name > Regional 2:Upload to Season 2 under Regional
+-/upload_hindi Show Name:Upload to Hindi Dubbed directly
+-/upload_regional Show Name:Upload to Regional directly
+❌ Delete:
+-/delete Show Name > Regional ➜ Deletes whole show
+-/delete Show Name > Regional 2 ➜ Deletes Season 2
+-/delete Show Name > Regional 2 3 ➜ Deletes episode 3 from Season 2
+-/delete ShowName/EpisodeNumber ➜ Deletes flat episode
+-/delete_category hindi|regional ShowName Season Episode: to delete a specific episode
+-/delete_category hindi|regional ShowName Season: to delete a whole season
+-/delete_category hindi|regional ShowName: to delete a whole show
+📋 List:
+-/list: List all shows, seasons, and episodes.
+🔗 Get Links:
+-/get_links: Get links to all shows.
+📩 Report:
+-/report: Report missing shows or episodes.
+split_commands:-
+-/split_episode Sweet Home /6 > Hindi Dubbed:-Splits Episode 6 of flat list
+-/split_episode The Glory 2 /4 > Regional:-Splits Episode 4 of Season 2
+-/upload_split Show Name 2 /6 > 2→ Upload to part 2 of split episode 6
+-/upload_split Show Name 2 /6 > 1→ Upload to part 1 of split episode 6
+-/split_episode Show Name 2 /6 > 2→ Upload to part 2 of split episode 6
 """
     else:
         help_text = """
 User Help:
-- /search Query: Search for shows.
 - Tap on a show to view its seasons and episodes.
 - Videos will auto-delete after 3 minutes. Save or forward them to keep them.
+- Join our channel for updates.
+- https://t.me/KDRAMAAVIL: Join our channel for updates.
+ Report:
+- /report: Report missing shows or episodes.
 """
     await message.reply(help_text)
 
 
-    
-@app.on_message(filters.command("delete") & filters.user(ADMIN_ID))
-async def delete_content(client, message):
-    parts = message.text.split(" ", 1)
-    if len(parts) < 2:
-        return await message.reply("❗ Usage:\n/delete Show Name\n/delete Show Name SeasonNumber\n/delete Show Name SeasonNumber EpisodeNumber\n/delete ShowName/EpisodeNumber")
+@app.on_message(filters.command(["delete", "delete_category"]) & filters.user(ADMIN_ID))
+async def delete_content(client, message: Message):
+    if len(message.command) < 2:
+        return await message.reply("❗ Usage:\n"
+                                   "/delete Show\n"
+                                   "/delete Show > Category\n"
+                                   "/delete Show > Category 2\n"
+                                   "/delete Show > Category 2 3\n"
+                                   "/delete Show/EpisodeIndex\n"
+                                   "/delete_category hindi|regional ShowName\n"
+                                   "/delete_category hindi|regional ShowName Season [Episode]")
 
-    args = parts[1].strip()
+    args = message.text.split(" ", 1)[1].strip()
     data = load_data()
 
-    # ✅ NEW FORMAT: /delete Show Name/EpisodeNumber
+    # ✅ Case 1: Flat format like ShowName/3
     if "/" in args:
         try:
-            show_part, episode_part = args.rsplit("/", 1)
-            episode_index = int(episode_part) - 1
-        except ValueError:
-            return await message.reply("❗ Episode number must be a valid integer after '/'.")
-        
-        matched_show = None
-        for show in data:
-            if show == show_part.strip():
-                matched_show = show
-                break
+            show_part, episode_str = args.rsplit("/", 1)
+            episode_index = int(episode_str) - 1
+        except:
+            return await message.reply("❗ Episode must be a number after '/'.")
+        for cat in data:
+            if show_part in data[cat] and "episodes" in data[cat][show_part]:
+                episodes = data[cat][show_part]["episodes"]
+                if 0 <= episode_index < len(episodes):
+                    del episodes[episode_index]
+                    save_data(data)
+                    return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_part}* under *{cat}*")
+        return await message.reply("❌ Show or episode not found.")
 
-        if not matched_show:
-            return await message.reply("❗ Show not found.")
+    # ✅ Case 2: delete_category shortcut
+    if message.command[0] == "delete_category":
+        try:
+            parts = args.strip().split()
+            if len(parts) < 2:
+                return await message.reply("❗ Usage: /delete_category hindi|regional ShowName [Season] [Episode]")
+            category_key = parts[0].lower()
+            if category_key not in ["hindi", "regional"]:
+                return await message.reply("❗ Category must be 'hindi' or 'regional'")
+            category = "Hindi Dubbed" if category_key == "hindi" else "Regional"
+            show_name = parts[1]
+            season = parts[2] if len(parts) >= 3 else None
+            episode_index = int(parts[3]) - 1 if len(parts) == 4 else None
+        except:
+            return await message.reply("❗ Invalid format for /delete_category")
 
-        if "episodes" not in data[matched_show] or episode_index < 0 or episode_index >= len(data[matched_show]["episodes"]):
-            return await message.reply("❗ Episode index out of range or no episodes found under show.")
+        if show_name not in data.get(category, {}):
+            return await message.reply("❌ Show not found in category.")
 
-        del data[matched_show]["episodes"][episode_index]
-        save_data(data)
-        return await message.reply(f"✅ Deleted episode {episode_index + 1} directly from *{matched_show}* (not from a season)")
+        if not season:
+            del data[category][show_name]
+            save_data(data)
+            return await message.reply(f"✅ Deleted full show *{show_name}* from *{category}*")
 
-    # 🧠 Original formats (Show, Season, or Show + Season + Episode)
+        if season not in data[category][show_name]:
+            return await message.reply("❌ Season not found.")
+        if episode_index is not None:
+            episodes = data[category][show_name][season]
+            if 0 <= episode_index < len(episodes):
+                del episodes[episode_index]
+                save_data(data)
+                return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_name}* Season {season} under *{category}*")
+            else:
+                return await message.reply("❌ Episode index out of range.")
+        else:
+            del data[category][show_name][season]
+            save_data(data)
+            return await message.reply(f"✅ Deleted Season {season} from *{show_name}* under *{category}*")
+
+    # ✅ Case 3: format with ">"
     show_name = None
-    season_number = None
+    category = "Hindi Dubbed"
+    season = None
     episode_index = None
+    if ">" in args:
+        try:
+            left, right = args.split(">", 1)
+            show_name = left.strip()
+            right = right.strip().split()
+            if len(right) == 1:
+                category = right[0].title()
+            elif len(right) == 2:
+                category = right[0].title()
+                season = right[1]
+            elif len(right) == 3:
+                category = right[0].title()
+                season = right[1]
+                episode_index = int(right[2]) - 1
+        except:
+            return await message.reply("❗ Invalid format for /delete.")
+    else:
+        show_name = args
 
-    for name in data.keys():
-        if args.startswith(name):
-            remainder = args[len(name):].strip().split()
-            show_name = name
-            if len(remainder) >= 1:
-                season_number = remainder[0]
-            if len(remainder) == 2:
-                try:
-                    episode_index = int(remainder[1]) - 1
-                except ValueError:
-                    return await message.reply("❗ Episode index must be a number.")
-            break
+    if category not in data or show_name not in data[category]:
+        return await message.reply("❌ Show not found.")
 
-    if not show_name:
-        return await message.reply("❗ Show not found.")
-
-    # Case 1: Delete entire show
-    if season_number is None:
-        del data[show_name]
+    if season:
+        if season not in data[category][show_name]:
+            return await message.reply("❌ Season not found.")
+        if episode_index is not None:
+            episodes = data[category][show_name][season]
+            if episode_index < 0 or episode_index >= len(episodes):
+                return await message.reply("❌ Episode index out of range.")
+            del episodes[episode_index]
+            save_data(data)
+            return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_name}* Season {season} under *{category}*")
+        else:
+            del data[category][show_name][season]
+            save_data(data)
+            return await message.reply(f"✅ Deleted Season {season} from *{show_name}* under *{category}*")
+    else:
+        del data[category][show_name]
         save_data(data)
-        return await message.reply(f"✅ Deleted entire show: {show_name}")
-
-    # Case 2: Delete entire season
-    if episode_index is None:
-        if season_number not in data[show_name]:
-            return await message.reply("❗ Season not found.")
-        del data[show_name][season_number]
-        save_data(data)
-        return await message.reply(f"✅ Deleted season {season_number} under {show_name}")
-
-    # Case 3: Delete specific episode under season
-    if season_number not in data[show_name]:
-        return await message.reply("❗ Season not found.")
-    episodes = data[show_name][season_number]
-    if episode_index < 0 or episode_index >= len(episodes):
-        return await message.reply("❗ Episode index out of range.")
-    del episodes[episode_index]
-    save_data(data)
-    return await message.reply(f"✅ Deleted episode {episode_index + 1} from {show_name} Season {season_number}")
-
-
-        
-@app.on_callback_query(filters.regex("^episode_(.+)_(.+)_(\\d+)$"))
+        return await message.reply(f"✅ Deleted full show *{show_name}* from *{category}*")
+@app.on_callback_query(filters.regex("^episode_"))
 async def send_episode(client, callback_query: CallbackQuery):
-    show_name, season_or_key, index = callback_query.data.split("_")[1:]
-    index = int(index) - 1
-    data = load_data()
-
-    if show_name not in data or season_or_key not in data[show_name]:
-        await callback_query.answer("Episode not found.")
-        return
-
     try:
-        file_id = data[show_name][season_or_key][index]
-        await client.send_video(
+        # Remove the "episode_" prefix safely
+        payload = callback_query.data[len("episode_"):]
+        parts = payload.split("_")
+        
+        # We expect at least 4 parts: category, show_name (can be joined), season_or_key, index
+        if len(parts) < 4:
+            return await callback_query.answer("❌ Invalid episode data.")
+
+        category = parts[0]
+        index_str = parts[-1]
+        season_or_key = parts[-2]
+        show_name_parts = parts[1:-2]
+        show_name = "_".join(show_name_parts)  # Reconstruct show name safely
+
+        index = int(index_str) - 1
+        data = load_data()
+
+        if show_name not in data.get(category, {}):
+            return await callback_query.answer("❌ Show not found.")
+
+        if season_or_key not in data[category][show_name]:
+            return await callback_query.answer("❌ Season or episode list not found.")
+
+        episode_list = data[category][show_name][season_or_key]
+        if index < 0 or index >= len(episode_list):
+            return await callback_query.answer("❌ Episode index out of range.")
+
+        file_id = episode_list[index]
+        sent_msg = await client.send_video(
             chat_id=callback_query.from_user.id,
             video=file_id,
-            caption=f"{show_name} - Episode {index + 1}"
+            caption=f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}"
         )
-    except Exception as e:
-        print(f"Send episode error: {e}")
-        await callback_query.answer("⚠️ Failed to send video.")
 
+        await callback_query.answer("✅ Sent video. It will auto-delete in 3 minutes.")
+        await asyncio.sleep(180)
+        await sent_msg.delete()
+
+    except Exception as e:
+        print(f"[send_episode] ERROR: {e}")
+        await callback_query.answer("⚠️ Error while sending episode.")
 
 @app.on_message(filters.command("test_forward"))
 async def test_forward(client, message):
