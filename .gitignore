@@ -23,4 +23,5 @@ build/
 Thumbs.db
 
 # Analysis tool
+# pleasen run
 .qodo/
