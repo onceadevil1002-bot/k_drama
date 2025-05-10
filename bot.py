@@ -72,7 +72,6 @@ def migrate_category():
 # Call it once in main
 migrate_category()
 
-app = Client("kdrama_bot")
 from urllib.parse import unquote
 
 joined_users = set()  # In-memory per-session; use DB for permanent join tracking
