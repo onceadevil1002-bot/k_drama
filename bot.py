@@ -1,6 +1,8 @@
 import os
 import re
 from pymongo import MongoClient
+from dotenv import load_dotenv
+from pyrogram import Client
 import asyncio
 from urllib.parse import unquote
 from pyrogram import Client, filters
@@ -11,23 +13,28 @@ from pyrogram.types import (
     CallbackQuery,
 )
 
+# Load environment variables from .env
+load_dotenv()
 
 # === Load Environment Variables ===
-API_ID=25916987
-API_HASH="ae252401c519461df086a9a80adff4b8"
-BOT_TOKEN="8093776997:AAEuLbrAlx7LPYMU487j0cjK3GBnnxkWzHI"
-ADMIN_ID =6244759828
-MAIN_CHANNEL_LINK="https://t.me/KDRAMAAVIL"
-STORAGE_CHANNEL_id="@anudram"  
+API_ID = int(os.getenv("API_ID", 25916987))
+API_HASH = os.getenv("API_HASH", "ae252401c519461df086a9a80adff4b8")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8093776997:AAEuLbrAlx7LPYMU487j0cjK3GBnnxkWzHI")
+ADMIN_ID = int(os.getenv("ADMIN_ID", 6244759828))
+STORAGE_CHANNEL_id = os.getenv("STORAGE_CHANNEL_ID", "@anudram")
+MAIN_CHANNEL_LINK = os.getenv("MAIN_CHANNEL_LINK", "https://t.me/KDRAMAAVIL")
+
+
 
 
 app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# === MongoDB Database ===
-MONGO_URI = "mongodb+srv://kdrama_bot:shows@cluster0.7i4xnv0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0"
+# === MongoDB Connection ===
+MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://kdrama_bot:shows@cluster0.7i4xnv0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 client = MongoClient(MONGO_URI)
 db = client['kdrama']  # <-- YOUR DATABASE NAME
 collection = db['shows']        # <-- YOUR COLLECTION NAME
+
 
 # Load data grouped by category
 def load_data():
@@ -57,18 +64,12 @@ def slugify_show_name(name: str) -> str:
 # === Global State ===
 upload_state = {}  # user_id: {"show": show_name, "season": season_number}
 
-# Constants
-MAIN_CHANNEL_LINK = "https://t.me/KDRAMAAVIL"  # Replace with your main channel
-
 # One-time migration (run once to assign category to old shows)
 def migrate_category():
     collection.update_many({"category": {"$exists": False}}, {"$set": {"category": "Hindi Dubbed"}})
 
 # Call it once in main
 migrate_category()
-
-MAIN_CHANNEL_LINK = "https://t.me/KDRAMAAVIL"
-ADMIN_ID = 6244759828
 
 app = Client("kdrama_bot")
 from urllib.parse import unquote
