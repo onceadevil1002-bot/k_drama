@@ -17,12 +17,13 @@ from pyrogram.types import (
 load_dotenv()
 
 # === Load Environment Variables ===
-API_ID = int(os.getenv("API_ID", 25916987))
-API_HASH = os.getenv("API_HASH", "ae252401c519461df086a9a80adff4b8")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8093776997:AAEuLbrAlx7LPYMU487j0cjK3GBnnxkWzHI")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 6244759828))
-STORAGE_CHANNEL_id = os.getenv("STORAGE_CHANNEL_ID", "@anudram")
-MAIN_CHANNEL_LINK = os.getenv("MAIN_CHANNEL_LINK", "https://t.me/KDRAMAAVIL")
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_ID = int(os.environ["ADMIN_ID"])
+STORAGE_CHANNEL_id = os.environ["STORAGE_CHANNEL_ID"]
+MAIN_CHANNEL_LINK = os.environ["MAIN_CHANNEL_LINK"]
+
 
 
 
@@ -30,7 +31,7 @@ MAIN_CHANNEL_LINK = os.getenv("MAIN_CHANNEL_LINK", "https://t.me/KDRAMAAVIL")
 app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # === MongoDB Connection ===
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://kdrama_bot:shows@cluster0.7i4xnv0.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+MONGO_URI = os.environ["MONGO_URI"]
 client = MongoClient(MONGO_URI)
 db = client['kdrama']  # <-- YOUR DATABASE NAME
 collection = db['shows']        # <-- YOUR COLLECTION NAME
