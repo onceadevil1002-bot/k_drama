@@ -699,12 +699,17 @@ Admin Help Commands:
   /upload_split Show Name > Hindi Dubbed 1 4 2
 
 🧹 Delete Shows/Episodes:
-  /delete Show Name > Hindi Dubbed
-  /delete Show Name > Regional 2
-  /delete Show Name > Regional 2 3
-  /delete_category hindi ShowName
-  /delete_category regional ShowName Season
-  /delete_category hindi ShowName Season Episode
+Hindi Dubbed Delete Commands
+/delete Show Name — Deletes the whole show from Hindi Dubbed.
+/delete Show Name Season — Deletes a specific season.
+/delete Show Name Season /Episode — Deletes a specific episode.
+/delete Show Name Season /SplitEpisode — Deletes a split episode part.
+
+Regional Delete Commands
+/delete_regional Show Name — Deletes the whole show from Regional.
+/delete_regional Show Name Season — Deletes a specific season.
+/delete_regional Show Name Season /Episode — Deletes a specific episode.
+/delete_regional Show Name Season /SplitEpisode — Deletes a split episode part.
 
 🔗 Utilities:
   /get_links – Generate deep links to each show
@@ -722,55 +727,30 @@ User Commands:
 """
     await message.reply(admin_help if is_admin else user_help)
 
-@app.on_message(filters.command(["delete", "delete_category"]) & filters.user(ADMIN_ID))
-async def delete_content(client, message: Message):
-    if len(message.command) < 2:
-        return await message.reply("❗ Usage:\n"
-                                   "/delete Show\n"
-                                   "/delete Show > Category\n"
-                                   "/delete Show > Category 2\n"
-                                   "/delete Show > Category 2 3\n"
-                                   "/delete Show/EpisodeIndex\n"
-                                   "/delete_category hindi|regional ShowName\n"
-                                   "/delete_category hindi|regional ShowName Season [Episode]")
+@app.on_message(filters.command("delete") & filters.user(ADMIN_ID))
+async def delete_hindi_content(client, message: Message):
+    try:
+        args = message.text.split(" ", 1)[1].strip()
+        data = load_data()
 
-    args = message.text.split(" ", 1)[1].strip()
-    data = load_data()
+        if "/" in args:
+            show_season, episode_str = args.rsplit("/", 1)
+            episode_index = int(episode_str.strip()) - 1
+        else:
+            show_season = args
+            episode_index = None
 
-    # ✅ Case 1: Flat format like ShowName/3
-    if "/" in args:
-        try:
-            show_part, episode_str = args.rsplit("/", 1)
-            episode_index = int(episode_str) - 1
-        except:
-            return await message.reply("❗ Episode must be a number after '/'.")
-        for cat in data:
-            if show_part in data[cat] and "episodes" in data[cat][show_part]:
-                episodes = data[cat][show_part]["episodes"]
-                if 0 <= episode_index < len(episodes):
-                    del episodes[episode_index]
-                    save_data(data)
-                    return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_part}* under *{cat}*")
-        return await message.reply("❌ Show or episode not found.")
+        parts = show_season.rsplit(" ", 1)
+        if parts[-1].isdigit():
+            show_name = parts[0].strip()
+            season = parts[1].strip()
+        else:
+            show_name = show_season.strip()
+            season = None
 
-    # ✅ Case 2: delete_category shortcut
-    if message.command[0] == "delete_category":
-        try:
-            parts = args.strip().split()
-            if len(parts) < 2:
-                return await message.reply("❗ Usage: /delete_category hindi|regional ShowName [Season] [Episode]")
-            category_key = parts[0].lower()
-            if category_key not in ["hindi", "regional"]:
-                return await message.reply("❗ Category must be 'hindi' or 'regional'")
-            category = "Hindi Dubbed" if category_key == "hindi" else "Regional"
-            show_name = parts[1]
-            season = parts[2] if len(parts) >= 3 else None
-            episode_index = int(parts[3]) - 1 if len(parts) == 4 else None
-        except:
-            return await message.reply("❗ Invalid format for /delete_category")
-
+        category = "Hindi Dubbed"
         if show_name not in data.get(category, {}):
-            return await message.reply("❌ Show not found in category.")
+            return await message.reply("❌ Show not found in Hindi Dubbed.")
 
         if not season:
             del data[category][show_name]
@@ -779,64 +759,72 @@ async def delete_content(client, message: Message):
 
         if season not in data[category][show_name]:
             return await message.reply("❌ Season not found.")
-        if episode_index is not None:
-            episodes = data[category][show_name][season]
-            if 0 <= episode_index < len(episodes):
-                del episodes[episode_index]
-                save_data(data)
-                return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_name}* Season {season} under *{category}*")
-            else:
-                return await message.reply("❌ Episode index out of range.")
-        else:
-            del data[category][show_name][season]
-            save_data(data)
-            return await message.reply(f"✅ Deleted Season {season} from *{show_name}* under *{category}*")
 
-    # ✅ Case 3: format with ">"
-    show_name = None
-    category = "Hindi Dubbed"
-    season = None
-    episode_index = None
-    if ">" in args:
-        try:
-            left, right = args.split(">", 1)
-            show_name = left.strip()
-            right = right.strip().split()
-            if len(right) == 1:
-                category = right[0].title()
-            elif len(right) == 2:
-                category = right[0].title()
-                season = right[1]
-            elif len(right) == 3:
-                category = right[0].title()
-                season = right[1]
-                episode_index = int(right[2]) - 1
-        except:
-            return await message.reply("❗ Invalid format for /delete.")
-    else:
-        show_name = args
-
-    if category not in data or show_name not in data[category]:
-        return await message.reply("❌ Show not found.")
-
-    if season:
-        if season not in data[category][show_name]:
-            return await message.reply("❌ Season not found.")
         if episode_index is not None:
             episodes = data[category][show_name][season]
             if episode_index < 0 or episode_index >= len(episodes):
                 return await message.reply("❌ Episode index out of range.")
             del episodes[episode_index]
             save_data(data)
-            return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_name}* Season {season} under *{category}*")
-        else:
-            del data[category][show_name][season]
-            save_data(data)
-            return await message.reply(f"✅ Deleted Season {season} from *{show_name}* under *{category}*")
-    else:
-        del data[category][show_name]
+            return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_name}* Season {season}.")
+
+        del data[category][show_name][season]
         save_data(data)
-        return await message.reply(f"✅ Deleted full show *{show_name}* from *{category}*")
+        return await message.reply(f"✅ Deleted Season {season} from *{show_name}*.")
+
+    except Exception as e:
+        print("Delete Hindi Error:", e)
+        return await message.reply("❌ Failed to process delete command.")
+
+@app.on_message(filters.command("delete_regional") & filters.user(ADMIN_ID))
+async def delete_regional_content(client, message: Message):
+    try:
+        args = message.text.split(" ", 1)[1].strip()
+        data = load_data()
+
+        if "/" in args:
+            show_season, episode_str = args.rsplit("/", 1)
+            episode_index = int(episode_str.strip()) - 1
+        else:
+            show_season = args
+            episode_index = None
+
+        parts = show_season.rsplit(" ", 1)
+        if parts[-1].isdigit():
+            show_name = parts[0].strip()
+            season = parts[1].strip()
+        else:
+            show_name = show_season.strip()
+            season = None
+
+        category = "Regional"
+        if show_name not in data.get(category, {}):
+            return await message.reply("❌ Show not found in Regional.")
+
+        if not season:
+            del data[category][show_name]
+            save_data(data)
+            return await message.reply(f"✅ Deleted full show *{show_name}* from *{category}*")
+
+        if season not in data[category][show_name]:
+            return await message.reply("❌ Season not found.")
+
+        if episode_index is not None:
+            episodes = data[category][show_name][season]
+            if episode_index < 0 or episode_index >= len(episodes):
+                return await message.reply("❌ Episode index out of range.")
+            del episodes[episode_index]
+            save_data(data)
+            return await message.reply(f"✅ Deleted episode {episode_index + 1} from *{show_name}* Season {season}.")
+
+        del data[category][show_name][season]
+        save_data(data)
+        return await message.reply(f"✅ Deleted Season {season} from *{show_name}*.")
+
+    except Exception as e:
+        print("Delete Regional Error:", e)
+        return await message.reply("❌ Failed to process delete command.")
+
 @app.on_callback_query(filters.regex("^episode_"))
 async def send_episode(client, callback_query: CallbackQuery):
     try:
