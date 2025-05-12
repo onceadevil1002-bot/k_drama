@@ -85,7 +85,7 @@ async def start(client, message: Message):
     args = message.text.split()
     slug = args[1] if len(args) > 1 else None
 
-    # Force join check
+    # Force join for new users
     if not slug and user_id not in joined_users:
         keyboard = [
             [InlineKeyboardButton("📣 Join Main Channel", url=MAIN_CHANNEL_LINK)],
@@ -93,25 +93,33 @@ async def start(client, message: Message):
         ]
         return await message.reply("🔒 Please join our channel to use the bot.", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    # Slug handling: Format => Hindi_Dubbed__Sweet_Home
     if slug and "__" in slug:
         try:
             category_part, show_part = slug.split("__", 1)
-            category = category_part.replace("_", " ").title().strip()
+            # Normalize safely
+            category = category_part.replace("_", " ").lower().strip()
             show_name = show_part.replace("_", " ").strip()
+
+            # Match against lowercased category keys
+            matched_category = None
+            for existing_category in data:
+                if existing_category.lower().strip() == category:
+                    matched_category = existing_category
+                    break
+
+            if not matched_category or show_name not in data[matched_category]:
+                return await message.reply("❌ Show not found or category mismatch.")
         except:
             return await message.reply("❌ Invalid link format.")
 
-        if category not in data or show_name not in data[category]:
-            return await message.reply("❌ Show not found.")
-
-        buttons = [[InlineKeyboardButton(f"⭐ {show_name}", callback_data=f"show_{category}_{show_name}")]]
-        for s in sorted(data[category]):
+        # ✅ Build inline buttons
+        buttons = [[InlineKeyboardButton(f"⭐ {show_name}", callback_data=f"show_{matched_category}_{show_name}")]]
+        for s in sorted(data[matched_category]):
             if s != show_name:
-                emoji = "🎞" if category == "Hindi Dubbed" else "🌍"
-                buttons.append([InlineKeyboardButton(f"{emoji} {s}", callback_data=f"show_{category}_{s}")])
+                emoji = "🎞" if matched_category == "Hindi Dubbed" else "🌍"
+                buttons.append([InlineKeyboardButton(f"{emoji} {s}", callback_data=f"show_{matched_category}_{s}")])
 
-        title = "🎞 Hindi Dubbed Shows:" if category == "Hindi Dubbed" else "🌍 Regional Shows:"
+        title = "🎞 Hindi Dubbed Shows:" if matched_category == "Hindi Dubbed" else "🌍 Regional Shows:"
         joined_users.add(user_id)
         return await message.reply(title, reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -637,70 +645,82 @@ async def get_links(client, message):
 
     bot_username = (await client.get_me()).username
     links = []
+    added = set()
 
     for category in data:
-        for show_name in data[category]:
-            # Format: Hindi_Dubbed__Sweet_Home
+        for show_name, content in data[category].items():
+            # Skip if it's a nested season inside another show (not valid show)
+            if not isinstance(content, dict):
+                continue
+
+            # Only generate once per unique show name
+            if show_name in added:
+                continue
+
             slug = f"{category.replace(' ', '_')}__{show_name.replace(' ', '_')}"
             link = f"https://t.me/{bot_username}?start={slug}"
             links.append(f"🔗 [{show_name} ({category})]({link})")
+            added.add(show_name)
 
     await message.reply(
         "**🎬 Direct Show Links:**\n\n" + "\n".join(links),
         disable_web_page_preview=True
     )
 
+
+# === Help Command (Updated) ===
 @app.on_message(filters.command("help"))
 async def help_command(client, message):
-    if message.from_user.id == ADMIN_ID:
-        help_text = """
-Admin Help:
-🛠️ Add Commands:
--/add Show Name 1 → Adds Season 1 (as number only) to an existing show
--/add Show Name > Category 2 → Adds Season 2 under a category
--/add Show Name → Adds show to default "Hindi Dubbed"
--/add Show Name > Regional → Adds show to "Regional"
--/add_hindi and /add_regional also supported
-📤 Upload:
--/upload Show Name:Upload flat episodes (Hindi Dubbed)
--/upload Show Name 1:Upload to Season 1
--/upload Show Name > Regional:Upload flat episodes under Regional
--/upload Show Name > Regional 2:Upload to Season 2 under Regional
--/upload_hindi Show Name:Upload to Hindi Dubbed directly
--/upload_regional Show Name:Upload to Regional directly
-❌ Delete:
--/delete Show Name > Regional ➜ Deletes whole show
--/delete Show Name > Regional 2 ➜ Deletes Season 2
--/delete Show Name > Regional 2 3 ➜ Deletes episode 3 from Season 2
--/delete ShowName/EpisodeNumber ➜ Deletes flat episode
--/delete_category hindi|regional ShowName Season Episode: to delete a specific episode
--/delete_category hindi|regional ShowName Season: to delete a whole season
--/delete_category hindi|regional ShowName: to delete a whole show
-📋 List:
--/list: List all shows, seasons, and episodes.
-🔗 Get Links:
--/get_links: Get links to all shows.
-📩 Report:
--/report: Report missing shows or episodes.
-split_commands:-
--/split_episode Sweet Home /6 > Hindi Dubbed:-Splits Episode 6 of flat list
--/split_episode The Glory 2 /4 > Regional:-Splits Episode 4 of Season 2
--/upload_split Show Name 2 /6 > 2→ Upload to part 2 of split episode 6
--/upload_split Show Name 2 /6 > 1→ Upload to part 1 of split episode 6
--/split_episode Show Name 2 /6 > 2→ Upload to part 2 of split episode 6
-"""
-    else:
-        help_text = """
-User Help:
-- Tap on a show to view its seasons and episodes.
-- Videos will auto-delete after 3 minutes. Save or forward them to keep them.
-- Join our channel for updates.
-- https://t.me/KDRAMAAVIL: Join our channel for updates.
- Report:
-- /report: Report missing shows or episodes.
-"""
-    await message.reply(help_text)
+    is_admin = message.from_user.id == ADMIN_ID
+    admin_help = """
+Admin Help Commands:
 
+📁 Add Shows/Seasons:
+  /add Show Name
+  /add Show Name > Hindi Dubbed
+  /add Show Name > Regional
+  /add Show Name 1
+  /add Show Name > Hindi Dubbed 2
+  /add_hindi Show Name
+  /add_regional Show Name
+
+📤 Upload Videos:
+  /upload Show Name
+  /upload Show Name 1
+  /upload Show Name > Regional
+  /upload Show Name > Hindi Dubbed 2
+  /upload_hindi Show Name
+  /upload_regional Show Name
+
+🎬 Split & Upload Parts:
+  /split_episode Show Name /4 > Hindi Dubbed
+  /split_episode Show Name 2 /3 > Regional
+  /upload_split Show Name > Regional 2 3 1
+  /upload_split Show Name > Hindi Dubbed 1 4 2
+
+🧹 Delete Shows/Episodes:
+  /delete Show Name > Hindi Dubbed
+  /delete Show Name > Regional 2
+  /delete Show Name > Regional 2 3
+  /delete_category hindi ShowName
+  /delete_category regional ShowName Season
+  /delete_category hindi ShowName Season Episode
+
+🔗 Utilities:
+  /get_links – Generate deep links to each show
+  /list – Show structure of uploaded data
+  /test_forward – Verify message forwarding works
+"""
+
+    user_help = """
+User Commands:
+- /start – Start bot
+- /help – Show this help
+- /report – Report missing episodes or shows
+- Watch episodes using inline buttons.
+- All videos auto-delete after 3 minutes.
+"""
+    await message.reply(admin_help if is_admin else user_help)
 
 @app.on_message(filters.command(["delete", "delete_category"]) & filters.user(ADMIN_ID))
 async def delete_content(client, message: Message):
