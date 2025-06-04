@@ -36,6 +36,10 @@ client = MongoClient(MONGO_URI)
 db = client['kdrama']  # <-- YOUR DATABASE NAME
 collection = db['shows']        # <-- YOUR COLLECTION NAME
 
+#==memory structure===
+REPORTS = {}
+reply_waiting = {}
+
 
 # Load data grouped by category
 def load_data():
@@ -130,7 +134,8 @@ async def start(client, message: Message):
         [InlineKeyboardButton("🌐 Regional", callback_data="category_regional")],
         [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
     ]
-    return await message.reply("🎬 Welcome to K-Drama Bot! Choose a category:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return await message.reply("🎬 Welcome to K-Drama Bot! Choose a category :\n"
+                               " 😉please Join to Main channel we will Grow'😙", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 @app.on_callback_query(filters.regex("^category_hindi$"))
@@ -600,21 +605,80 @@ async def handle_report(client, callback_query: CallbackQuery):
     return
 
 
+
+
+# === USER REPORT HANDLER ===
 @app.on_message(filters.text & ~filters.command(["start", "help", "add", "upload", "delete"]) & ~filters.user(ADMIN_ID))
-async def forward_report(client, message):
-    if message.text:
-        # Forward the report to the admin
-        await client.send_message(ADMIN_ID, f"📩 User Report: {message.text}")
+async def handle_user_report(client, message: Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if not text:
+        return await message.reply("❗ Empty message, Please Enter your report.")
+
+    try:
+        # ✅ send report to admin with inline reply button
+        report_msg = await client.send_message(
+            ADMIN_ID,
+            f"📩 New Report from `{user_id}`:\n\n{message.text}",
+            reply_markup=InlineKeyboardMarkup([[ 
+                InlineKeyboardButton("💬 Reply", callback_data=f"reply_to_{user_id}")
+            ]])
+        )
         
-        # Inform the user that their report has been sent
-        await message.reply("✅ Report sent! It will be added soon if available in official dub in 1-2 days.")
-        
-        # Delete the user's message after 60 seconds to keep the chat clean
-        await asyncio.sleep(60)
-        try:
-            await message.delete()
-        except:
-            pass
+        # ✅ save users id using admin message id
+        REPORTS[str(report_msg.message_id)] = user_id
+
+        # ✅ Confirm to the user
+        await message.reply("✅ Report sent! the admin will reply soon if needed ")
+    
+    except Exception as e:
+        # if anything falls 
+        await message.reply("❌ Failed to send report. Please try again later.")
+        print("[handle_users_report] Error:", e)
+        return
+      
+
+
+
+
+
+
+# === BUTTON REPLY FROM ADMIN ===
+@app.on_callback_query(filters.regex("^reply_to_"))
+async def handle_reply_button(client, callback: CallbackQuery):
+    try:
+        user_id = int(callback.data.split("_")[2])
+        reply_waiting[callback.from_user.id] = user_id
+        await callback.message.reply("✍️ Send your reply now. It will be forwarded to the user.")
+        await callback.answer()
+     
+    except Exception as e:
+        print("[reply_to_] Error:", e)
+        await callback.answer("⚠️ Failed to initiate reply.")
+
+
+# === ACTUAL REPLY FROM ADMIN ===
+@app.on_message(filters.text & filters.user(ADMIN_ID))
+async def admin_reply_to_user(client, message: Message):
+    admin_id = message.from_user.id
+    target_id = reply_waiting.get(admin_id)
+
+    if not target_id:
+        return  # Ignore regular admin messages not linked to a reply
+
+    try:
+        await client.send_message(
+            target_id,
+            f"📢 Admin replied to your report:\n\n{message.text}"
+        )
+        await message.reply("✅ Your reply has been sent to the user.")
+    except Exception as e:
+        await message.reply(f"❌ Failed to send reply: {e}")
+
+    # Clean up
+    del reply_waiting[admin_id]
+
 
 @app.on_message(filters.command("list") & filters.user(ADMIN_ID))
 async def list_content(client, message):
@@ -724,6 +788,7 @@ User Commands:
 - /report – Report missing episodes or shows
 - Watch episodes using inline buttons.
 - All videos auto-delete after 3 minutes.
+- https://t.me/KDRAMAAVIL
 """
     await message.reply(admin_help if is_admin else user_help)
 
