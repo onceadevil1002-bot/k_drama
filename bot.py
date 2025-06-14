@@ -575,17 +575,19 @@ async def show_menu(client, callback_query):
 
 
 
-@app.on_message(filters.command([
-    "split_hindi", "split_regional", "split_jap", "split_c", "split_arb"
-]) & filters.user(ADMIN_ID))
+@app.on_message(filters.command(["split_hindi", "split_jap", "split_c", "split_regional", "split_arb"]) & filters.user(ADMIN_ID))
 async def split_episode_command(client, message: Message):
     try:
+        # Split the command and check for the correct format
         cmd = message.command[0]
         if len(message.command) < 2 or "/" not in message.text:
             return await message.reply(
-                "❗ Usage:\n"
-                "/split_hindi Show Name /Episode\n"
-                "/split_hindi Show Name Season /Episode"
+                "❗️ Usage:\n"
+                "/split_hindi Show Name Season No/Episode No\n"
+                "/split_jap Show Name Season No/Episode No\n"
+                "/split_c Show Name Season No/Episode No\n"
+                "/split_regional Show Name Season No/Episode No\n"
+                "/split_arb Show Name Season No/Episode No"
             )
 
         args = message.text.split(" ", 1)[1].strip()
@@ -597,28 +599,28 @@ async def split_episode_command(client, message: Message):
         show_name = " ".join(tokens[:-1]) if tokens[-1].isdigit() else " ".join(tokens)
         season_number = tokens[-1] if tokens[-1].isdigit() else None
 
+        # Map commands to categories
         cmd_category_map = {
             "split_hindi": "Hindi Dubbed",
-            "split_regional": "Regional",
             "split_jap": "Japanese Drama",
             "split_c": "C Drama",
+            "split_regional": "Regional",
             "split_arb": "Arabic"
         }
         category = cmd_category_map.get(cmd)
 
         data = load_data()
 
+        # Check if the show exists in the category
         if category not in data or show_name not in data[category]:
             return await message.reply("❌ Show not found in category.")
 
-        episodes = (
-            data[category][show_name].get(season_number)
-            if season_number else data[category][show_name].get("episodes")
-        )
+        episodes = data[category][show_name].get(season_number) if season_number else data[category][show_name].get("episodes")
 
         if not episodes:
             return await message.reply("❌ Season or episode list not found.")
 
+        # Check if the episode index is valid
         if episode_index < 0 or episode_index >= len(episodes):
             return await message.reply("❌ Episode index out of range.")
 
@@ -626,7 +628,7 @@ async def split_episode_command(client, message: Message):
         if isinstance(original, list):
             return await message.reply("⚠️ Episode is already split.")
 
-        # Convert to [part1, None]
+        # Split the episode into two parts
         episodes[episode_index] = [original, None]
         save_data(data)
 
@@ -637,14 +639,15 @@ async def split_episode_command(client, message: Message):
         print("[split_episode_command] error:", e)
         return await message.reply("❌ Failed to split episode.")
 
-
-@app.on_message(filters.command("upload_split") & filters.user(ADMIN_ID))
+@app.on_message(filters.command(["upload_hindi", "upload_jap", "upload_c", "upload_regional", "upload_arb"]) & filters.user(ADMIN_ID))
 async def upload_split(client, message: Message):
     try:
         args = message.text.split(" ", 1)[1]
         show_part, rest = args.split(">", 1)
         show_name = show_part.strip()
         parts = rest.strip().split()
+
+        # Expecting 4 parts (category, season, episode number, part index)
         if len(parts) != 4:
             raise ValueError
 
@@ -658,30 +661,34 @@ async def upload_split(client, message: Message):
 
         data = load_data()
 
+        # Check if the category and show exist
         if category not in data or show_name not in data[category]:
             return await message.reply("❌ Show not found.")
         if season not in data[category][show_name]:
             return await message.reply("❌ Season not found.")
         episodes = data[category][show_name][season]
 
+        # Validate the episode index
         if episode < 1 or episode > len(episodes):
             return await message.reply("❌ Episode index out of range.")
 
         if not isinstance(episodes[episode - 1], list):
             return await message.reply("❌ Episode not split. Use /split_episode first.")
 
+        # Mark the episode upload part
         upload_state[message.from_user.id] = {
             "show": show_name,
             "season": season,
             "category": category,
             "split_index": episode - 1,
-            "part": part_index - 1  # for Python index
+            "part": part_index - 1  # For Python index
         }
 
         await message.reply(f"📤 Send video for *{show_name}* Season {season} Episode {episode} Part {part_index}")
-    except:
-        await message.reply("❗ Usage:\n/upload_split Show > Category Season EpisodeIndex Part")
 
+    except Exception as e:
+        print("[upload_split] error:", e)
+        await message.reply("❗️ Usage:\n/upload_split Show > Category Season EpisodeIndex Part")
 
 
 @app.on_callback_query(filters.regex("^noop$"))
