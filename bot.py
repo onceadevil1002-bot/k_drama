@@ -2,6 +2,7 @@ from gc import callbacks
 import os
 import dns.resolver
 import re
+import time
 from pymongo import MongoClient
 from dotenv import load_dotenv
 from pyrogram import Client, filters
@@ -13,6 +14,9 @@ from pyrogram.types import (
 )
 import asyncio
 from urllib.parse import unquote, quote
+def is_valid_url(text):
+    url_pattern = r'^https?://[\S]+'
+    return re.match(url_pattern, text)
 
 # Load environment variables from .env
 load_dotenv()
@@ -42,27 +46,47 @@ collection = db['shows']
 
 REPORTS = {}
 reply_waiting = {}
+# Poster upload state
+poster_upload_state = {}
 
+
+# Load data from MongoDB
 def load_data():
     data = {"Hindi Dubbed": {}, "Regional": {}}
     for doc in collection.find():
         category = doc.get("category", "Hindi Dubbed")
         show_name = doc["show_name"]
         episodes = doc["episodes"]
+        poster = doc.get("poster", [])
+
         if category not in data:
             data[category] = {}
+
+        # ensure poster doesn't overwrite season data
+        episodes = {str(k): v for k, v in episodes.items()}
+        if isinstance(poster, list):
+            episodes["poster"] = poster
+            
+
         data[category][show_name] = episodes
     return data
 
+# Save data to MongoDB
 def save_data(data):
     collection.delete_many({})
     for category, shows in data.items():
-        for show_name, episodes in shows.items():
+        for show_name, show_data in shows.items():
+            poster = show_data.get("poster", [])
+            episodes = dict(show_data)
+            if "poster" in episodes:
+                del episodes["poster"]
             collection.insert_one({
                 "category": category,
                 "show_name": show_name,
-                "episodes": episodes
+                "episodes": episodes,
+                "poster": poster
             })
+
 
 def slugify_show_name(name: str) -> str:
     return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
@@ -283,7 +307,9 @@ async def add_show(client, message):
         data[category] = {}
 
     if show_name not in data[category]:
-        data[category][show_name] = {"episodes": []}
+        data[category][show_name] = {}
+        data[category][show_name]["poster"] = []  # ✅ Targeted change: add poster list
+
         await message.reply(f"✅ Added show: *{show_name}* under *{category}*")
 
     if season_number:
@@ -293,6 +319,70 @@ async def add_show(client, message):
         await message.reply(f"✅ Added *Season {season_number}* under *{show_name}*")
 
     save_data(data)
+
+@app.on_message(filters.command("add_poster") & filters.user(ADMIN_ID))
+async def add_poster_cmd(client, message):
+    try:
+        cmd = message.text.split(" ", 1)[1].strip()
+        if ">" not in cmd:
+            return await message.reply("❌ Use format: `/add_poster Show Name > Category`", quote=True)
+
+        show_name, category = map(str.strip, cmd.split(">"))
+
+        # Store state
+        poster_upload_state[message.from_user.id] = {
+            "show_name": show_name,
+            "category": category,
+            "file_ids": [],
+            "deadline": time.time() + 60
+        }
+
+        await message.reply("🖼 Send 1–6 poster screenshots now (within 60 seconds)...")
+
+    except IndexError:
+        await message.reply("❌ Use format: `/add_poster Show Name > Category`", quote=True)
+
+@app.on_message(filters.photo & filters.user(ADMIN_ID))
+async def collect_poster(client, message):
+    user_id = message.from_user.id
+    state = poster_upload_state.get(user_id)
+
+    if not state:
+        return  # Not in poster upload mode
+
+    if time.time() > state["deadline"]:
+        del poster_upload_state[user_id]
+        return await message.reply("⏱ Time expired! Please run `/add_poster` again.")
+
+    file_id = message.photo.file_id
+    state["file_ids"].append(file_id)
+
+    if len(state["file_ids"]) >= 1:
+        await finalize_poster_upload(client, message)
+
+@app.on_message(filters.command("done") & filters.user(ADMIN_ID))
+async def manual_done_poster(client, message):
+    user_id = message.from_user.id
+    if user_id in poster_upload_state:
+        await finalize_poster_upload(client, message)
+
+
+async def finalize_poster_upload(client, message):
+    user_id = message.from_user.id
+    state = poster_upload_state.pop(user_id, None)
+
+    if not state or not state["file_ids"]:
+        return await message.reply("❌ No posters received.")
+
+    result = collection.update_one(
+        {"show_name": state["show_name"], "category": state["category"]},
+        {"$set": {"poster": state["file_ids"]}}
+    )
+
+    if result.modified_count > 0:
+        await message.reply(f"✅ Poster uploaded for *{state['show_name']}*.", quote=True)
+    else:
+        await message.reply("❌ Show not found or poster not saved.", quote=True)
 
 @app.on_message(filters.command([
     "upload", "upload_hindi", "upload_regional",
@@ -366,6 +456,19 @@ async def upload_handler(client, message: Message):
             "season": season_number,
             "category": category
         }
+            # ✅ Also allow links directly after /upload
+        if is_valid_url(message.text.strip()):
+            data = load_data()
+            episodes = data[category][show_name][season_number] if season_number else data[category][show_name]["episodes"]
+
+            episodes.append({
+                "type": "link",
+                "content": message.text.strip()
+            })
+
+            save_data(data)
+            return await message.reply("🔗 Link episode saved successfully.")
+
         return await message.reply(f"📤 Send videos now for *{show_name}* Season *{season_number}*", quote=True)
     
     else:
@@ -422,10 +525,15 @@ async def handle_video(client, message: Message):
             save_data(data)
             return await message.reply(f"✅ Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
 
+        episode_data = {
+            "type": "video",
+            "content": file_id
+        }
+
         if season_number:
-            data[category][show_name].setdefault(season_number, []).append(file_id)
+            data[category][show_name].setdefault(season_number, []).append(episode_data)
         else:
-            data[category][show_name].setdefault("episodes", []).append(file_id)
+            data[category][show_name].setdefault("episodes", []).append(episode_data)
 
         save_data(data)
 
@@ -437,6 +545,8 @@ async def handle_video(client, message: Message):
     except Exception as e:
         print("Upload error:", e)
         await message.reply("❌ Failed to upload. Please check bot permissions or channel ID.")
+
+
 @app.on_callback_query(filters.regex("^multi_"))
 async def multi_part_episode_menu(client, callback: CallbackQuery):
     try:
@@ -503,10 +613,24 @@ async def season_menu(client, callback_query):
             )
         ])
 
-    await callback_query.message.edit(
-        f"🎬 {show_name} - Season {season_number}",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    caption = f"🎬 {show_name.replace('_', ' ')} - Season {season_number}"
+    poster_list = data[category][show_name].get("poster", [])
+    poster = poster_list[-1] if isinstance(poster_list, list) and poster_list else None
+
+    if poster:
+        await client.send_photo(
+            chat_id=callback_query.from_user.id,
+            photo=poster,
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await callback_query.message.edit(
+            caption,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    await callback_query.answer()
 
 
 @app.on_callback_query(filters.regex("^show_(.+?)_(.+)$"))
@@ -527,30 +651,78 @@ async def show_menu(client, callback_query):
             if isinstance(ep, list):  # split episode
                 buttons.append([
                     InlineKeyboardButton(
-                        f"📁 Episode {idx} (split)", callback_data=f"multi_{category}_{show_name}_episodes_{idx}"
+                        f"📁 Episode {idx} (split)",
+                        callback_data=f"multi_{category}_{show_name}_episodes_{idx}"
                     )
                 ])
             else:
                 buttons.append([
                     InlineKeyboardButton(
-                        f"Episode {idx}", callback_data=f"episode_{category}_{show_name}_episodes_{idx}"
+                        f"Episode {idx}",
+                        callback_data=f"episode_{category}_{show_name}_episodes_{idx}"
                     )
                 ])
+
     # Handle seasons
     for season in episodes:
-        if season != "episodes":
+        if season not in ["episodes", "poster"]:
             buttons.append([
-                InlineKeyboardButton(f"📁 Season {season}", callback_data=f"season_{category}_{show_name}_{season}")
+                InlineKeyboardButton(
+                    f"📁 Season {season}",
+                    callback_data=f"season_{category}_{show_name}_{season}"
+                )
             ])
 
     if not buttons:
         buttons.append([InlineKeyboardButton("🚫 No videos uploaded yet", callback_data="noop")])
 
-    await callback_query.message.edit(
-        f"📺 Show: {show_name}",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+    caption = f"📺 Show: {show_name.replace('_', ' ')}"
+    poster_list = data[category][show_name].get("poster", [])
+    poster = poster_list[-1] if isinstance(poster_list, list) and poster_list else None
 
+    if poster:
+        await client.send_photo(
+            chat_id=callback_query.from_user.id,
+            photo=poster,
+            caption=caption,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await callback_query.message.edit(
+            caption,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    await callback_query.answer()
+
+
+@app.on_message(filters.photo & filters.user(ADMIN_ID))
+async def handle_poster_photo(client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in poster_upload_state:
+        return
+    
+    state = poster_upload_state[user_id]
+    
+    # Check if we've reached the max posters (6)
+    if len(state["file_ids"]) >= 6:
+        return await message.reply("❌ Maximum 6 posters allowed. Use /add_poster again if needed.")
+    
+    # Forward to storage channel and get file_id
+    try:
+        fwd = await message.forward(STORAGE_CHANNEL_ID, disable_notification=True)
+        state["file_ids"].append(fwd.photo.file_id)
+        await fwd.delete()  # Clean up storage channel
+        
+        remaining = 6 - len(state["file_ids"])
+        if remaining > 0:
+            await message.reply(f"🖼 Poster received ({len(state['file_ids'])}/6). Send more or wait to auto-finalize.")
+        else:
+            await finalize_poster_upload(client, message)
+            
+    except Exception as e:
+        print("Poster upload error:", e)
+        await message.reply("❌ Failed to process poster.")
 
 
 @app.on_message(filters.command(["split_hindi", "split_jap", "split_c", "split_arb"]) & filters.user(ADMIN_ID))
@@ -674,7 +846,15 @@ async def upload_split_handler(client, message: Message):
         )
     except Exception as e:
         print("[upload_split_handler] error:", e)
-        return await message.reply("❌ Failed to process upload split.")@app.on_callback_query(filters.regex("^noop$"))
+        return await message.reply("❌ Failed to process upload split.")
+
+async def send_poster_if_exists(client, chat_id, show_name, category):
+    doc = collection.find_one({"show_name": show_name, "category": category})
+    posters = doc.get("poster", []) if doc else []
+    for file_id in posters:
+        await client.send_photo(chat_id, file_id)
+    
+@app.on_callback_query(filters.regex("^noop$"))
 async def do_nothing(client, callback_query: CallbackQuery):
     await callback_query.answer("Nothing to show here.")
 
@@ -993,12 +1173,17 @@ async def send_episode(client, callback_query: CallbackQuery):
         show_name = "_".join(show_name_parts)
         index = int(index_str) - 1
         data = load_data()
+        await send_poster_if_exists(client, callback_query.from_user.id, show_name.replace("_", " "), category)
+
 
         if show_name not in data.get(category, {}):
             return await callback_query.answer("❌ Show not found.")
 
         if season_or_key not in data[category][show_name]:
             return await callback_query.answer("❌ Season or episode list not found.")
+        
+        if season_or_key == "poster":
+            return await callback_query.answer("⚠️ Poster is not an episode.")
 
         episode_list = data[category][show_name][season_or_key]
 
@@ -1026,11 +1211,36 @@ async def send_episode(client, callback_query: CallbackQuery):
             )
 
         # Normal full episode
-        sent_msg = await client.send_video(
-            chat_id=callback_query.from_user.id,
-            video=episode_data,
-            caption=f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}"
-        )
+        # Handle old plain string format
+        if isinstance(episode_data, str):
+            episode_data = { "type": "video", "content": episode_data }
+
+        if episode_data["type"] == "video":
+            sent_msg = await client.send_video(
+                chat_id=callback_query.from_user.id,
+                video=episode_data["content"],
+                caption=f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}"
+            )
+            await callback_query.answer("✅ Sent video. It will auto-delete in 3 minutes.")
+            await asyncio.sleep(180)
+            await sent_msg.delete()
+
+        elif episode_data["type"] == "link":
+            await client.send_message(
+                chat_id=callback_query.from_user.id,
+                text=(
+                    f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}\n"
+                    f"📥 Download Link 👇"
+                ),
+                reply_markup=InlineKeyboardMarkup([[ 
+                    InlineKeyboardButton("▶ Watch Episode", url=episode_data["content"])
+                ]]),
+                disable_web_page_preview=False
+            )
+            await callback_query.answer("✅ Sent link.")
+            return  # prevent fallthrough to final video logic
+
+
         await callback_query.answer("✅ Sent video. It will auto-delete in 3 minutes.")
         await asyncio.sleep(180)
         await sent_msg.delete()
@@ -1170,6 +1380,39 @@ async def handle_reply_button(client, callback: CallbackQuery):
         await callback.answer("⚠️ Failed to initiate reply.")
 
 
+@app.on_message(filters.text & ~filters.regex(r"^/\w+") & filters.user(ADMIN_ID))
+async def handle_link(client, message: Message):
+    user_id = message.from_user.id
+    if user_id not in upload_state:
+        return  # not in upload mode
+
+    from re import match
+
+    url = message.text.strip()
+    if not match(r"^https?://", url):
+        return  # not a link
+
+    state = upload_state[user_id]
+    show = state["show"]
+    season = state["season"]
+    category = state["category"]
+
+    data = load_data()
+
+    if season:
+        data[category][show].setdefault(season, []).append({
+            "type": "link",
+            "content": url
+        })
+    else:
+        data[category][show].setdefault("episodes", []).append({
+            "type": "link",
+            "content": url
+        })
+
+    save_data(data)
+    await message.reply("🔗 Link episode saved successfully.")
+
 # === ACTUAL REPLY FROM ADMIN ===
 @app.on_message(filters.text & filters.user(ADMIN_ID))
 async def admin_reply_to_user(client, message: Message):
@@ -1194,6 +1437,7 @@ async def admin_reply_to_user(client, message: Message):
 @app.on_message()
 async def debug_all(client, message):
     print(f"[DEBUG] Message from {message.from_user.id}: {message.text}")
+
 
 
 
