@@ -1,21 +1,19 @@
 from pymongo import MongoClient
-from dotenv import load_dotenv
-import os
-import json
+from pprint import pprint
 
-# Load environment variables from .env
-load_dotenv()
+# Replace with your existing connection info
+MONGO_URI = "mongodb://kdrama_bot:show@ac-nuextg1-shard-00-00.7i4xnv0.mongodb.net:27017/admin?ssl=true"
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+db = client['kdrama']
+collection = db['shows']
 
-# Connect to MongoDB
-MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
+# Replace with your actual values
+category = "Hindi Dubbed"
+show_name = "Head Over Heels"
 
-# Access collection
-db = client["kdrama"]
-collection = db["shows"]
+doc = collection.find_one({
+    "category": category,
+    "show_name": show_name
+})
 
-# Fetch and print all documents with formatting
-print("📂 All Documents in MongoDB:\n")
-for doc in collection.find():
-    print(json.dumps(doc, indent=2, default=str))
-    print("=" * 50)
+pprint(doc)

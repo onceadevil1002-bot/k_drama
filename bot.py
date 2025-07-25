@@ -72,22 +72,30 @@ def load_data():
     return data
 
 # Save data to MongoDB
-def save_data(data):
-    collection.delete_many({})
+def save_data(category, show_name, show_data):
+    """
+    Safely updates or inserts a single show's data without affecting others.
+    """
+    mongo_collection.update_one(
+        {"category": category, "show_name": show_name},
+        {
+            "$set": {
+                "episodes": {k: v for k, v in show_data.items() if k != "poster"},
+                "poster": show_data.get("poster", [])
+            }
+        },
+        upsert=True
+    )
+
+
+def save_all_data(data):
+    """
+    Rewrites entire MongoDB database from full in-memory data.
+    Use only when needed (e.g., backup or /get_links).
+    """
     for category, shows in data.items():
         for show_name, show_data in shows.items():
-            poster = show_data.get("poster", [])
-            episodes = dict(show_data)
-            if "poster" in episodes:
-                del episodes["poster"]
-            collection.insert_one({
-                "category": category,
-                "show_name": show_name,
-                "episodes": episodes,
-                "poster": poster
-            })
-
-
+            save_data(category, show_name, show_data)
 def slugify_show_name(name: str) -> str:
     return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
 
@@ -318,7 +326,7 @@ async def add_show(client, message):
         data[category][show_name][season_number] = []
         await message.reply(f"✅ Added *Season {season_number}* under *{show_name}*")
 
-    save_data(data)
+    save_data(category, show_name, data[category][show_name])
 
 @app.on_message(filters.command("add_poster") & filters.user(ADMIN_ID))
 async def add_poster_cmd(client, message):
@@ -466,7 +474,7 @@ async def upload_handler(client, message: Message):
                 "content": message.text.strip()
             })
 
-            save_data(data)
+            save_data(category, show_name, data[category][show_name])
             return await message.reply("🔗 Link episode saved successfully.")
 
         return await message.reply(f"📤 Send videos now for *{show_name}* Season *{season_number}*", quote=True)
@@ -522,7 +530,7 @@ async def handle_video(client, message: Message):
                 episodes[split_index].append(None)
 
             episodes[split_index][part] = file_id
-            save_data(data)
+            save_data(category, show_name, data[category][show_name])
             return await message.reply(f"✅ Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
 
         episode_data = {
@@ -535,7 +543,7 @@ async def handle_video(client, message: Message):
         else:
             data[category][show_name].setdefault("episodes", []).append(episode_data)
 
-        save_data(data)
+        save_data(category, show_name, data[category][show_name])
 
         await message.reply(
             f"✅ Uploaded and saved for *{show_name}*{' Season ' + season_number if season_number else ''}.",
@@ -783,7 +791,7 @@ async def split_episode_command(client, message: Message):
 
         # Mark the episode as split (into part 1 and part 2)
         episodes[episode_index] = [original, None]
-        save_data(data)
+        save_data(category, show_name, data[category][show_name])
 
         label = f"{episode_num} (S{season_number})" if season_number else f"{episode_num}"
         return await message.reply(f"✅ Episode {label} is now split into two parts (waiting for part 2).")
@@ -1130,7 +1138,7 @@ async def delete_content(client, message: Message):
         # === Handle full show deletion ===
         if season is None and episode_index is None:
             del data[category][show_name]
-            save_data(data)
+            save_data(category, show_name, data[category][show_name])
             return await message.reply(f"✅ Deleted *{show_name}* from *{category}*")
 
         # === Handle season deletion ===
@@ -1138,7 +1146,7 @@ async def delete_content(client, message: Message):
             if season not in data[category][show_name]:
                 return await message.reply("❌ Season not found.")
             del data[category][show_name][season]
-            save_data(data)
+            save_data(category, show_name, data[category][show_name])
             return await message.reply(f"✅ Deleted *Season {season}* from *{show_name}*")
 
         # === Handle episode deletion ===
@@ -1150,7 +1158,7 @@ async def delete_content(client, message: Message):
         if episode_index < 0 or episode_index >= len(episodes):
             return await message.reply("❌ Episode index out of range.")
         del episodes[episode_index]
-        save_data(data)
+        save_data(category, show_name, data[category][show_name])
         return await message.reply(f"✅ Deleted Episode {episode_index + 1} from *{show_name}* {f'Season {season}' if season else ''}")
 
     except Exception as e:
@@ -1173,7 +1181,7 @@ async def send_episode(client, callback_query: CallbackQuery):
         show_name = "_".join(show_name_parts)
         index = int(index_str) - 1
         data = load_data()
-        await send_poster_if_exists(client, callback_query.from_user.id, show_name.replace("_", " "), category)
+        
 
 
         if show_name not in data.get(category, {}):
@@ -1410,7 +1418,7 @@ async def handle_link(client, message: Message):
             "content": url
         })
 
-    save_data(data)
+    save_all_data(data)
     await message.reply("🔗 Link episode saved successfully.")
 
 # === ACTUAL REPLY FROM ADMIN ===
