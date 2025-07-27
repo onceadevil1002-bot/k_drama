@@ -1157,12 +1157,16 @@ async def delete_content(client, message: Message):
             episode_index = None
 
         # 🔎 Determine category
-        cmd_category_map = {
-            "delete": "Hindi Dubbed",
-            "delete_regional": "Regional",
-            "delete_jap": "Japanese Drama",
-            "delete_c": "C Drama",
-            "delete_arb": "Arabic"
+        CATEGORY_ALIASES = {
+            "hindi": "Hindi Dubbed",
+            "jap": "Japanese Drama",
+            "japanese": "Japanese Drama",
+            "c": "C Drama",
+            "c-drama": "C Drama",
+            "chinese": "C Drama",
+            "arb": "Arabic Drama",
+            "arabic": "Arabic Drama",
+            "regional": "Regional"
         }
         category = cmd_category_map.get(cmd, "Hindi Dubbed")
         data = load_data()
