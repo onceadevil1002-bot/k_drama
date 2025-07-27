@@ -1,5 +1,7 @@
 from gc import callbacks
+from datetime import datetime
 import os
+import json
 import dns.resolver
 import re
 import time
@@ -52,50 +54,60 @@ poster_upload_state = {}
 
 # Load data from MongoDB
 def load_data():
-    data = {"Hindi Dubbed": {}, "Regional": {}}
+    data = {}
     for doc in collection.find():
         category = doc.get("category", "Hindi Dubbed")
         show_name = doc["show_name"]
-        episodes = doc["episodes"]
+        episodes = doc.get("episodes", {})
         poster = doc.get("poster", [])
 
         if category not in data:
             data[category] = {}
 
-        # ensure poster doesn't overwrite season data
-        episodes = {str(k): v for k, v in episodes.items()}
-        if isinstance(poster, list):
+        # Ensure it's a dictionary and attach poster safely
+        if isinstance(episodes, dict):
             episodes["poster"] = poster
-            
+            data[category][show_name] = episodes
+        else:
+            # Handle corrupted data (rare case)
+            data[category][show_name] = {"episodes": episodes, "poster": poster}
 
-        data[category][show_name] = episodes
     return data
+def backup_database():
+    now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    backup_dir = "backups"
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.join(backup_dir, f"mongo_backup_{now}.json")
 
+    data = list(collection.find())
+    for item in data:
+        item["_id"] = str(item["_id"])  # Convert ObjectId to string for JSON
+
+    with open(backup_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+    print(f"✅ Database backed up to: {backup_path}")
 # Save data to MongoDB
-def save_data(category, show_name, show_data):
-    """
-    Safely updates or inserts a single show's data without affecting others.
-    """
-    mongo_collection.update_one(
-        {"category": category, "show_name": show_name},
-        {
-            "$set": {
-                "episodes": {k: v for k, v in show_data.items() if k != "poster"},
-                "poster": show_data.get("poster", [])
-            }
-        },
-        upsert=True
-    )
-
-
-def save_all_data(data):
-    """
-    Rewrites entire MongoDB database from full in-memory data.
-    Use only when needed (e.g., backup or /get_links).
-    """
+def save_data(data):
     for category, shows in data.items():
         for show_name, show_data in shows.items():
-            save_data(category, show_name, show_data)
+            # Separate out poster safely
+            poster = show_data.get("poster", [])
+            
+            # Create a deep copy of the show data to avoid modifying the original
+            episodes = {k: v for k, v in show_data.items() if k != "poster"}
+
+            # Save into MongoDB
+            collection.update_one(
+                {"category": category, "show_name": show_name},
+                {"$set": {
+                    "category": category,
+                    "show_name": show_name,
+                    "episodes": episodes,
+                    "poster": poster
+                }},
+                upsert=True
+            )
 def slugify_show_name(name: str) -> str:
     return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
 
@@ -325,19 +337,39 @@ async def add_show(client, message):
             return await message.reply("⚠️ Season already exists.")
         data[category][show_name][season_number] = []
         await message.reply(f"✅ Added *Season {season_number}* under *{show_name}*")
+    backup_database()
+    save_data(data)
 
-    save_data(category, show_name, data[category][show_name])
+# Top-level alias map
+CATEGORY_ALIASES = {
+    "hindi": "Hindi Dubbed",
+    "jap": "Japanese Drama",
+    "japanese": "Japanese Drama",
+    "c": "C Drama",
+    "c-drama": "C Drama",
+    "chinese": "C Drama",
+    "arb": "Arabic Drama",
+    "arabic": "Arabic Drama",
+    "regional": "Regional"
+}
 
 @app.on_message(filters.command("add_poster") & filters.user(ADMIN_ID))
 async def add_poster_cmd(client, message):
     try:
         cmd = message.text.split(" ", 1)[1].strip()
         if ">" not in cmd:
-            return await message.reply("❌ Use format: `/add_poster Show Name > Category`", quote=True)
+            return await message.reply("❌ Use format: /add_poster Show Name > Category", quote=True)
 
-        show_name, category = map(str.strip, cmd.split(">"))
+        show_name, raw_category = map(str.strip, cmd.split(">"))
+        cat_key = raw_category.strip().lower()
+        category = CATEGORY_ALIASES.get(cat_key, raw_category.strip().title())
 
-        # Store state
+        # ✅ Check if the show exists under this category
+        data = load_data()
+        if category not in data or show_name not in data[category]:
+            return await message.reply(f"❌ Show *{show_name}* not found under *{category}*.")
+
+        # ✅ Store state
         poster_upload_state[message.from_user.id] = {
             "show_name": show_name,
             "category": category,
@@ -348,19 +380,21 @@ async def add_poster_cmd(client, message):
         await message.reply("🖼 Send 1–6 poster screenshots now (within 60 seconds)...")
 
     except IndexError:
-        await message.reply("❌ Use format: `/add_poster Show Name > Category`", quote=True)
-
+        await message.reply("❌ Use format: /add_poster Show Name > Category", quote=True)
 @app.on_message(filters.photo & filters.user(ADMIN_ID))
 async def collect_poster(client, message):
     user_id = message.from_user.id
     state = poster_upload_state.get(user_id)
 
     if not state:
-        return  # Not in poster upload mode
+        return
 
     if time.time() > state["deadline"]:
         del poster_upload_state[user_id]
-        return await message.reply("⏱ Time expired! Please run `/add_poster` again.")
+        return await message.reply("⏱️ Time expired! Please run /add_poster again.")
+
+    if len(state["file_ids"]) >= 6:
+        return await message.reply("❌ Max 6 posters allowed.")
 
     file_id = message.photo.file_id
     state["file_ids"].append(file_id)
@@ -374,7 +408,6 @@ async def manual_done_poster(client, message):
     if user_id in poster_upload_state:
         await finalize_poster_upload(client, message)
 
-
 async def finalize_poster_upload(client, message):
     user_id = message.from_user.id
     state = poster_upload_state.pop(user_id, None)
@@ -387,11 +420,10 @@ async def finalize_poster_upload(client, message):
         {"$set": {"poster": state["file_ids"]}}
     )
 
-    if result.modified_count > 0:
-        await message.reply(f"✅ Poster uploaded for *{state['show_name']}*.", quote=True)
+    if result.matched_count > 0:
+        await message.reply(f"✅ Poster uploaded for *{state['show_name']}*.")
     else:
-        await message.reply("❌ Show not found or poster not saved.", quote=True)
-
+        await message.reply("❌ Show not found or poster not saved.")
 @app.on_message(filters.command([
     "upload", "upload_hindi", "upload_regional",
     "upload_jap", "upload_c", "upload_arb"
@@ -473,8 +505,8 @@ async def upload_handler(client, message: Message):
                 "type": "link",
                 "content": message.text.strip()
             })
-
-            save_data(category, show_name, data[category][show_name])
+            backup_database()
+            save_data(data)
             return await message.reply("🔗 Link episode saved successfully.")
 
         return await message.reply(f"📤 Send videos now for *{show_name}* Season *{season_number}*", quote=True)
@@ -530,7 +562,8 @@ async def handle_video(client, message: Message):
                 episodes[split_index].append(None)
 
             episodes[split_index][part] = file_id
-            save_data(category, show_name, data[category][show_name])
+            backup_database()
+            save_data(data)
             return await message.reply(f"✅ Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
 
         episode_data = {
@@ -542,8 +575,8 @@ async def handle_video(client, message: Message):
             data[category][show_name].setdefault(season_number, []).append(episode_data)
         else:
             data[category][show_name].setdefault("episodes", []).append(episode_data)
-
-        save_data(category, show_name, data[category][show_name])
+        backup_database()
+        save_data(data)
 
         await message.reply(
             f"✅ Uploaded and saved for *{show_name}*{' Season ' + season_number if season_number else ''}.",
@@ -791,7 +824,8 @@ async def split_episode_command(client, message: Message):
 
         # Mark the episode as split (into part 1 and part 2)
         episodes[episode_index] = [original, None]
-        save_data(category, show_name, data[category][show_name])
+        backup_database()
+        save_data(data)
 
         label = f"{episode_num} (S{season_number})" if season_number else f"{episode_num}"
         return await message.reply(f"✅ Episode {label} is now split into two parts (waiting for part 2).")
@@ -1067,6 +1101,7 @@ async def help_command(client, message):
   /list – Display all shows & structure
   /test_forward – Check forwarding
   /report – Handle user reports
+  /add_poster Mercy for None > Hindi Dubbed
 
 ━━━━━━━━━━━━━━━
 🔗 CHANNEL
@@ -1138,7 +1173,8 @@ async def delete_content(client, message: Message):
         # === Handle full show deletion ===
         if season is None and episode_index is None:
             del data[category][show_name]
-            save_data(category, show_name, data[category][show_name])
+            backup_database()
+            save_data(data)
             return await message.reply(f"✅ Deleted *{show_name}* from *{category}*")
 
         # === Handle season deletion ===
@@ -1146,7 +1182,8 @@ async def delete_content(client, message: Message):
             if season not in data[category][show_name]:
                 return await message.reply("❌ Season not found.")
             del data[category][show_name][season]
-            save_data(category, show_name, data[category][show_name])
+            backup_database()
+            save_data(data)
             return await message.reply(f"✅ Deleted *Season {season}* from *{show_name}*")
 
         # === Handle episode deletion ===
@@ -1158,7 +1195,8 @@ async def delete_content(client, message: Message):
         if episode_index < 0 or episode_index >= len(episodes):
             return await message.reply("❌ Episode index out of range.")
         del episodes[episode_index]
-        save_data(category, show_name, data[category][show_name])
+        backup_database()
+        save_data(data)
         return await message.reply(f"✅ Deleted Episode {episode_index + 1} from *{show_name}* {f'Season {season}' if season else ''}")
 
     except Exception as e:
@@ -1417,8 +1455,8 @@ async def handle_link(client, message: Message):
             "type": "link",
             "content": url
         })
-
-    save_all_data(data)
+    backup_database()
+    save_data(data)
     await message.reply("🔗 Link episode saved successfully.")
 
 # === ACTUAL REPLY FROM ADMIN ===
