@@ -352,7 +352,20 @@ CATEGORY_ALIASES = {
     "arabic": "Arabic Drama",
     "regional": "Regional"
 }
-
+# 🔁 Global category alias map (normalize category names)
+CATEGORY_ALIASES = {
+    "Hindi Dubbed": "Hindi Dubbed",
+    "Regional": "Regional",
+    "Japanese Drama": "jap",
+    "Japanese": "jap",
+    "jap": "jap",
+    "C Drama": "c",
+    "Chinese": "c",
+    "c": "c",
+    "Arabic": "arb",
+    "Arabic Drama": "arb",
+    "arb": "arb"
+}
 @app.on_message(filters.command("add_poster") & filters.user(ADMIN_ID))
 async def add_poster_cmd(client, message):
     try:
@@ -1126,7 +1139,7 @@ async def delete_content(client, message: Message):
     try:
         cmd = message.command[0]
         if len(message.command) < 2:
-            return await message.reply("❗ Usage:\n/delete Show\n/delete Show Season\n/delete Show /Episode\n/delete Show Season /Episode")
+            return await message.reply("❗️ Usage:\n/delete Show\n/delete Show Season\n/delete Show /Episode\n/delete Show Season /Episode")
 
         args = message.text.split(" ", 1)[1].strip()
 
@@ -1157,17 +1170,15 @@ async def delete_content(client, message: Message):
             episode_index = None
 
         # 🔎 Determine category
-        CATEGORY_ALIASES = {
-            "hindi": "Hindi Dubbed",
-            "jap": "Japanese Drama",
-            "japanese": "Japanese Drama",
-            "c": "C Drama",
-            "c-drama": "C Drama",
-            "chinese": "C Drama",
-            "arb": "Arabic Drama",
-            "arabic": "Arabic Drama",
-            "regional": "Regional"
+        cmd_category_map = {
+            "delete": "Hindi Dubbed",
+            "delete_regional": "Regional",
+            "delete_jap": "jap",
+            "delete_c": "c",
+            "delete_arb": "arb"
         }
+        raw_category = cmd_category_map.get(cmd, "Hindi Dubbed")
+        category = CATEGORY_ALIASES.get(raw_category, raw_category)
         category = cmd_category_map.get(cmd, "Hindi Dubbed")
         data = load_data()
 
@@ -1206,7 +1217,6 @@ async def delete_content(client, message: Message):
     except Exception as e:
         print("❌ Delete Error:", e)
         return await message.reply("⚠️ Something went wrong while deleting.")
-
 @app.on_callback_query(filters.regex("^episode_"))
 async def send_episode(client, callback_query: CallbackQuery):
     try:
