@@ -366,23 +366,27 @@ CATEGORY_ALIASES = {
     "Arabic Drama": "arb",
     "arb": "arb"
 }
-@app.on_message(filters.command("add_poster") & filters.user(ADMIN_ID))
-async def add_poster_cmd(client, message):
-    try:
-        cmd = message.text.split(" ", 1)[1].strip()
-        if ">" not in cmd:
-            return await message.reply("❌ Use format: /add_poster Show Name > Category", quote=True)
+# Poster command handlers for each category
+POSTER_CATEGORY_COMMANDS = {
+    "add_poster": "Hindi Dubbed",
+    "add_poster_regional": "Regional",
+    "add_poster_jap": "Japanese Drama",
+    "add_poster_c": "C Drama",
+    "add_poster_arb": "Arabic Drama"
+}
 
-        show_name, raw_category = map(str.strip, cmd.split(">"))
-        cat_key = raw_category.strip().lower()
-        category = CATEGORY_ALIASES.get(cat_key, raw_category.strip().title())
+for cmd, category in POSTER_CATEGORY_COMMANDS.items():
+    @app.on_message(filters.command(cmd) & filters.user(ADMIN_ID))
+    async def add_poster_command(client, message, category=category):
+        try:
+            show_name = message.text.split(" ", 1)[1].strip()
+        except IndexError:
+            return await message.reply("❌ Usage: /{} Show Name".format(cmd))
 
-        # ✅ Check if the show exists under this category
         data = load_data()
         if category not in data or show_name not in data[category]:
             return await message.reply(f"❌ Show *{show_name}* not found under *{category}*.")
 
-        # ✅ Store state
         poster_upload_state[message.from_user.id] = {
             "show_name": show_name,
             "category": category,
@@ -391,9 +395,6 @@ async def add_poster_cmd(client, message):
         }
 
         await message.reply("🖼 Send 1–6 poster screenshots now (within 60 seconds)...")
-
-    except IndexError:
-        await message.reply("❌ Use format: /add_poster Show Name > Category", quote=True)
 @app.on_message(filters.photo & filters.user(ADMIN_ID))
 async def collect_poster(client, message):
     user_id = message.from_user.id
@@ -1023,11 +1024,17 @@ async def help_command(client, message):
   /add Show Name > C Drama
   /add Show Name > C Drama Season
 
-🔸 Arabic:
+🔸Arabic:
   /add_arb Show Name
   /add Show Name > Arabic
   /add Show Name > Arabic Season
 
+🔸 🖼 Poster Upload Commands:
+ /add_poster Show Name– Hindi Dubbed
+ /add_poster_regional Show Name– Regional
+ /add_poster_jap Show Name– Japanese
+ /add_poster_c Show Name– Chinese
+ /add_poster_arb Show Name– Arabic
 ━━━━━━━━━━━━━━━
 📤 UPLOAD VIDEOS
 ━━━━━━━━━━━━━━━
@@ -1109,6 +1116,8 @@ async def help_command(client, message):
 ━━━━━━━━━━━━━━━
 🛠 UTILITIES
 ━━━━━━━━━━━━━━━
+/add_poster S line  > regional
+
 
   /get_links – Get shareable links
   /list – Display all shows & structure
@@ -1170,16 +1179,16 @@ async def delete_content(client, message: Message):
             episode_index = None
 
         # 🔎 Determine category
+        # 🔎 Determine category
         cmd_category_map = {
             "delete": "Hindi Dubbed",
             "delete_regional": "Regional",
-            "delete_jap": "jap",
-            "delete_c": "c",
-            "delete_arb": "arb"
+            "delete_jap": "Japanese Drama",
+            "delete_c": "C Drama",
+            "delete_arb": "Arabic Drama"
         }
         raw_category = cmd_category_map.get(cmd, "Hindi Dubbed")
         category = CATEGORY_ALIASES.get(raw_category, raw_category)
-        category = cmd_category_map.get(cmd, "Hindi Dubbed")
         data = load_data()
 
         if show_name not in data.get(category, {}):
@@ -1188,32 +1197,55 @@ async def delete_content(client, message: Message):
         # === Handle full show deletion ===
         if season is None and episode_index is None:
             del data[category][show_name]
+            collection.delete_one({"category": category, "show_name": show_name})  # ✅ Actually remove from DB
             backup_database()
             save_data(data)
             return await message.reply(f"✅ Deleted *{show_name}* from *{category}*")
 
         # === Handle season deletion ===
+        # === Handle season deletion ===
         if season and episode_index is None:
             if season not in data[category][show_name]:
                 return await message.reply("❌ Season not found.")
+
+            # ✅ Delete from memory
             del data[category][show_name][season]
+
+            # ✅ Update DB to remove that season
+            collection.update_one(
+                {"category": category, "show_name": show_name},
+                {"$unset": {f"episodes.{season}": ""}}
+            )
+
             backup_database()
             save_data(data)
             return await message.reply(f"✅ Deleted *Season {season}* from *{show_name}*")
 
+        # === Handle episode deletion ===
         # === Handle episode deletion ===
         key = season if season else "episodes"
         if key not in data[category][show_name]:
             return await message.reply("❌ Season or episode list not found.")
 
         episodes = data[category][show_name][key]
+        if not isinstance(episodes, list):
+            return await message.reply("❌ This season/section doesn't contain a list of episodes.")
+
         if episode_index < 0 or episode_index >= len(episodes):
             return await message.reply("❌ Episode index out of range.")
+
+        # ✅ Delete episode from memory
         del episodes[episode_index]
+
+        # ✅ Save updated episodes to MongoDB
+        collection.update_one(
+            {"category": category, "show_name": show_name},
+            {"$set": {f"episodes.{key}": episodes}}
+        )
+
         backup_database()
         save_data(data)
         return await message.reply(f"✅ Deleted Episode {episode_index + 1} from *{show_name}* {f'Season {season}' if season else ''}")
-
     except Exception as e:
         print("❌ Delete Error:", e)
         return await message.reply("⚠️ Something went wrong while deleting.")
