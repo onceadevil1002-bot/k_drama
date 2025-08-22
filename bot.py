@@ -1,5 +1,5 @@
 from gc import callbacks
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import json
 import dns.resolver
@@ -7,7 +7,10 @@ import re
 import time
 from pymongo import MongoClient
 from dotenv import load_dotenv
-from pyrogram import Client, filters
+from pyrogram.client import Client
+from pyrogram import filters
+from pyrogram.enums import ChatMemberStatus, ChatType  # Add ChatType import
+from pyrogram.errors import UserNotParticipant
 from pyrogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
@@ -16,6 +19,7 @@ from pyrogram.types import (
 )
 import asyncio
 from urllib.parse import unquote, quote
+
 def is_valid_url(text):
     url_pattern = r'^https?://[\S]+'
     return re.match(url_pattern, text)
@@ -35,24 +39,162 @@ dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
 dns.resolver.default_resolver.nameservers = ['8.8.8.8']
 app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# === MongoDB Connection ===
+# === REQUIRED CHANNELS FOR VERIFICATION ===
+REQUIRED_CHANNELS = ["-1002648019848"]
 
-# Load MongoDB URI
+# === MongoDB Connection ===
 MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
-    raise ValueError("❌ MONGO_URI not set in environment variables.")
+    raise ValueError("MONGO_URI not set in environment variables.")
 
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10000)
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=40000, connectTimeoutMS=40000)
 db = client['kdrama']
 collection = db['shows']
+user_verification_collection = db['user_verification']
 
 REPORTS = {}
 reply_waiting = {}
-# Poster upload state
 poster_upload_state = {}
+upload_state = {}
 
+# === USER VERIFICATION TRACKING ===
+def get_user_verification_status(user_id):
+    """Check if user needs reverification (48 hours)"""
+    doc = user_verification_collection.find_one({"user_id": user_id})
+    if not doc:
+        return False
+    
+    last_verified = doc.get("last_verified")
+    if not last_verified:
+        return False
+    
+    # Check if 48 hours have passed
+    time_diff = datetime.now() - last_verified
+    return time_diff.total_seconds() < (48 * 60 * 60)  # 48 hours in seconds
 
-# Load data from MongoDB
+def update_user_verification(user_id):
+    """Update user verification timestamp"""
+    user_verification_collection.update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "last_verified": datetime.now()}},
+        upsert=True
+    )
+
+# === MONITORING FUNCTIONS (Silent - No Responses) ===
+def monitor_group_activity(message):
+    """Monitor group activity without responding"""
+    chat = message.chat
+    user_id = message.from_user.id if message.from_user else None
+    
+    if not user_id:
+        return
+    
+    # Log activity based on chat type
+    if chat.type == ChatType.SUPERGROUP:
+        # Check if it's a discussion-like group
+        if chat.title and any(keyword in chat.title.lower() for keyword in ["discussion", "chat", "talk", "kdrama", "drama"]):
+            print(f"[DISCUSSION-GROUP] User {user_id} in {chat.title}: {message.text[:30] if message.text else 'media'}...")
+        else:
+            print(f"[SUPERGROUP] User {user_id} in {chat.title}")
+    elif chat.type == ChatType.GROUP:
+        print(f"[GROUP] User {user_id} in {chat.title or 'Unknown Group'}")
+    elif chat.type == ChatType.CHANNEL:
+        print(f"[CHANNEL] Activity in {chat.title or 'Unknown Channel'}")
+    
+    # Check verification status (but don't respond in group)
+    if not get_user_verification_status(user_id):
+        print(f"[UNVERIFIED-USER] User {user_id} in group needs verification")
+
+# === GROUP/CHANNEL MESSAGE MONITOR (NO RESPONSES) ===
+@app.on_message(~filters.private)
+async def monitor_non_private_messages(client, message):
+    """
+    Monitor all group/channel messages but NEVER respond
+    This handler catches all non-private messages first
+    """
+    monitor_group_activity(message)
+    # Never send any response - just return silently
+    return
+
+# === YOUR EXISTING VERIFICATION LOGIC ===
+async def check_user_membership(client, user_id):
+    """Check if user is member of required channels with better error handling"""
+    missing = []
+    
+    for ch in REQUIRED_CHANNELS:
+        try:
+            # First try to get the chat
+            chat = await client.get_chat(ch)
+            
+            # Then check membership
+            member = await client.get_chat_member(chat.id, user_id)
+            status = getattr(member, "status", None)
+            
+            if status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+                missing.append(chat)
+                
+        except UserNotParticipant:
+            # User is not a participant
+            try:
+                chat = await client.get_chat(ch)
+                missing.append(chat)
+            except Exception as e:
+                print(f"[JOIN-CHECK] Could not get chat info for {ch}: {e}")
+                # Create a dummy chat object with channel info
+                missing.append(type('Chat', (), {
+                    'id': ch,
+                    'title': 'Required Channel',
+                    'username': None
+                })())
+                
+        except Exception as e:
+            error_msg = str(e).lower()
+            print(f"[JOIN-CHECK] Error checking {ch}: {e}")
+            
+            if "peer_id_invalid" in error_msg:
+                # Bot hasn't encountered this chat yet
+                try:
+                    # Try to resolve using username if available
+                    if ch == "-1002648019848":
+                        chat = await client.get_chat("@KDRAMAAVIL")
+                    elif ch == "-1002874700170":
+                        chat = await client.get_chat("@akddrama20")
+                    else:
+                        raise Exception("Unknown channel")
+                    
+                    # Now try membership check again
+                    member = await client.get_chat_member(chat.id, user_id)
+                    status = getattr(member, "status", None)
+                    
+                    if status not in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+                        missing.append(chat)
+                        
+                except UserNotParticipant:
+                    # User is not a participant
+                    missing.append(chat if 'chat' in locals() else type('Chat', (), {
+                        'id': ch,
+                        'title': 'Required Channel',
+                        'username': 'KDRAMAAVIL' if ch == "-1002648019848" else 'akddrama20'
+                    })())
+                    
+                except Exception as e2:
+                    print(f"[JOIN-CHECK] Fallback failed for {ch}: {e2}")
+                    # Add as missing with basic info
+                    missing.append(type('Chat', (), {
+                        'id': ch,
+                        'title': 'K-Drama Channel' if ch == "-1002648019848" else 'AKD Drama Channel',
+                        'username': 'KDRAMAAVIL' if ch == "-1002648019848" else 'akddrama20'
+                    })())
+            else:
+                # Other error, assume user needs to join
+                missing.append(type('Chat', (), {
+                    'id': ch,
+                    'title': 'Required Channel',
+                    'username': None
+                })())
+    
+    return missing
+# === YOUR EXISTING FUNCTIONS (Keep these unchanged) ===
 def load_data():
     data = {}
     for doc in collection.find():
@@ -64,15 +206,14 @@ def load_data():
         if category not in data:
             data[category] = {}
 
-        # Ensure it's a dictionary and attach poster safely
         if isinstance(episodes, dict):
             episodes["poster"] = poster
             data[category][show_name] = episodes
         else:
-            # Handle corrupted data (rare case)
             data[category][show_name] = {"episodes": episodes, "poster": poster}
 
     return data
+
 def backup_database():
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     backup_dir = "backups"
@@ -81,23 +222,18 @@ def backup_database():
 
     data = list(collection.find())
     for item in data:
-        item["_id"] = str(item["_id"])  # Convert ObjectId to string for JSON
+        item["_id"] = str(item["_id"])
 
     with open(backup_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-    print(f"✅ Database backed up to: {backup_path}")
-# Save data to MongoDB
+    print(f"Database backed up to: {backup_path}")
+
 def save_data(data):
     for category, shows in data.items():
         for show_name, show_data in shows.items():
-            # Separate out poster safely
             poster = show_data.get("poster", [])
-            
-            # Create a deep copy of the show data to avoid modifying the original
             episodes = {k: v for k, v in show_data.items() if k != "poster"}
-
-            # Save into MongoDB
             collection.update_one(
                 {"category": category, "show_name": show_name},
                 {"$set": {
@@ -108,31 +244,46 @@ def save_data(data):
                 }},
                 upsert=True
             )
-def slugify_show_name(name: str) -> str:
-    return re.sub(r'\W+', '', name.lower().replace(' ', '_'))
-
-upload_state = {}
 
 def migrate_category():
     collection.update_many({"category": {"$exists": False}}, {"$set": {"category": "Hindi Dubbed"}})
 
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
+        [InlineKeyboardButton("📂 Japanese Drama", callback_data="category_japanese")],
+        [InlineKeyboardButton("📂 C Drama", callback_data="category_c_drama")],
+        [InlineKeyboardButton("📂 Arabic", callback_data="category_arabic")],
+        [InlineKeyboardButton("🌍 Regional", callback_data="category_regional")],
+        [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
+    ])
+
 migrate_category()
 
-joined_users = set()
-
-@app.on_message(filters.command("start"))
-async def start(client, message: Message):
+# === PRIVATE MESSAGE HANDLERS (These will work normally) ===
+@app.on_message(filters.command("start") & filters.private)
+async def start(client, message):
     user_id = message.from_user.id
     data = load_data()
     args = message.text.split()
     slug = args[1] if len(args) > 1 else None
 
-    if not slug and user_id not in joined_users:
+    # Check if user is verified within last 48 hours
+    if get_user_verification_status(user_id):
+        return await message.reply(
+            "Welcome back! Choose a category:",
+            reply_markup=main_keyboard()
+        )
+
+    # User needs verification (first time or 48 hours passed)
+    if not slug and not get_user_verification_status(user_id):
         keyboard = [
-            [InlineKeyboardButton("📣 Join Main Channel", url=MAIN_CHANNEL_LINK)],
-            [InlineKeyboardButton("✅ I Joined", callback_data="joined")]
+            [InlineKeyboardButton("Join Channel 1", url="https://t.me/KDRAMAAVIL")],
+            [InlineKeyboardButton("Join Channel 2", url="https://t.me/AKDDRAMA20")],
+            [InlineKeyboardButton("I Joined Both", callback_data="joined")]
         ]
-        return await message.reply("🔒 Please join our channel to use the bot.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return await message.reply("Please join both channels to use the bot.",
+                                   reply_markup=InlineKeyboardMarkup(keyboard))
 
     if slug and "__" in slug:
         try:
@@ -147,79 +298,95 @@ async def start(client, message: Message):
                     break
 
             if not matched_category or show_name not in data[matched_category]:
-                return await message.reply("❌ Show not found or category mismatch.")
+                return await message.reply("Show not found or category mismatch.")
         except:
-            return await message.reply("❌ Invalid link format.")
+            return await message.reply("Invalid link format.")
 
-        buttons = [[InlineKeyboardButton(f"⭐️ {show_name}", callback_data=f"show_{matched_category}_{show_name}")]]
+        buttons = [[InlineKeyboardButton(f"{show_name}", callback_data=f"show_{matched_category}_{show_name}")]]
         for s in sorted(data[matched_category]):
             if s != show_name:
                 if matched_category == "Hindi Dubbed":
                     emoji = "🎞"
                 elif matched_category == "Regional":
-                    emoji = "🌐"
+                    emoji = "🌍"
                 elif matched_category == "Japanese Drama":
                     emoji = "🎌"
                 elif matched_category == "C Drama":
                     emoji = "📺"
                 elif matched_category == "Arabic":
-                    emoji = "🌍"
+                    emoji = "🌟"
                 else:
-                    emoji = "📁"
+                    emoji = "🎬"
                 buttons.append([InlineKeyboardButton(f"{emoji} {s}", callback_data=f"show_{matched_category}_{s}")])
 
         category_titles = {
             "Hindi Dubbed": "🎞 Hindi Dubbed Shows:",
-            "Regional": "🌐 Regional Shows:",
+            "Regional": "🌍 Regional Shows:",
             "Japanese Drama": "🎌 Japanese Shows:",
             "C Drama": "📺 C Drama Shows:",
-            "Arabic": "🌍 Arabic Shows:"
+            "Arabic": "🌟 Arabic Shows:"
         }
-        title = category_titles.get(matched_category, "📁 All Shows:")
+        title = category_titles.get(matched_category, "🎬 All Shows:")
 
-        joined_users.add(user_id)
+        update_user_verification(user_id)
         return await message.reply(title, reply_markup=InlineKeyboardMarkup(buttons))
 
-    joined_users.add(user_id)
-    keyboard = [
-        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
-        [InlineKeyboardButton("📂 Japanese Drama", callback_data="category_japanese")],
-        [InlineKeyboardButton("📂 C Drama", callback_data="category_c_drama")],
-        [InlineKeyboardButton("📂 Arabic", callback_data="category_arabic")],
-        [InlineKeyboardButton("🌐 Regional", callback_data="category_regional")],
-        [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
-    ]
+    update_user_verification(user_id)
     return await message.reply("🎬 Welcome to K-Drama Bot! Choose a category :\n"
-                               " 😉please Join to Main channel we will Grow'😙", reply_markup=InlineKeyboardMarkup(keyboard))
+                               " 😉please Join to Main channel we will Grow'😙", reply_markup=main_keyboard())
 
+@app.on_callback_query(filters.regex("^joined$"))
+async def joined_channel(client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    missing = await check_user_membership(client, user_id)
+
+    if missing:
+        lines = ["You still need to join these channels:"]
+        for m in missing:
+            if hasattr(m, "username") and m.username:
+                lines.append(f"👉 https://t.me/{m.username} ({m.title})")
+            elif hasattr(m, "title"):
+                lines.append(f"👉 🔒 {m.title} (private)")
+            else:
+                lines.append(f"👉 {m}")
+        return await callback.message.edit("\n".join(lines))
+
+    # Verified - update verification timestamp
+    update_user_verification(user_id)
+
+    await callback.message.edit(
+        "🎬 Welcome! Choose a category:",
+        reply_markup=main_keyboard()
+    )
+
+# Add all your other existing handlers here (categories, episodes, admin commands, etc.)
+# They will work normally in private chats
 
 @app.on_callback_query(filters.regex("^category_hindi$"))
 async def category_hindi(client, callback):
     data = load_data()
     if "Hindi Dubbed" not in data:
-        return await callback.answer("❌ No shows found.")
+        return await callback.answer("No shows found.")
     buttons = [
         [InlineKeyboardButton(f"🎞 {show}", callback_data=f"show_Hindi Dubbed_{show}")]
         for show in sorted(data["Hindi Dubbed"])
     ]
     await callback.message.edit("🎞 Hindi Dubbed Shows:", reply_markup=InlineKeyboardMarkup(buttons))
 
-
 @app.on_callback_query(filters.regex("^category_regional$"))
 async def category_regional(client, callback):
     data = load_data()
     if "Regional" not in data:
-        return await callback.answer("❌ No shows found.")
+        return await callback.answer("No shows found.")
     buttons = [
         [InlineKeyboardButton(f"🌍 {show}", callback_data=f"show_Regional_{show}")]
         for show in sorted(data["Regional"])
     ]
     await callback.message.edit("🌍 Regional Shows:", reply_markup=InlineKeyboardMarkup(buttons))
 
-# === Unified Category Show Listing ===
 @app.on_callback_query(filters.regex("^category_"))
 async def category_handler(client, callback_query):
-    category_code = callback_query.data.split("_", 1)[1]  # e.g., 'japanese', 'c_drama'
+    category_code = callback_query.data.split("_", 1)[1]
     
     category_map = {
         "japanese": "Japanese Drama",
@@ -228,7 +395,7 @@ async def category_handler(client, callback_query):
     }
     matched_category = category_map.get(category_code)
     if not matched_category:
-        return await callback_query.answer("❌ Unknown category.", show_alert=True)
+        return await callback_query.answer("Unknown category.", show_alert=True)
 
     data = load_data()
 
@@ -247,30 +414,23 @@ async def category_handler(client, callback_query):
     else:
         await callback_query.answer("No shows found in this category.", show_alert=True)
 
-
-
-@app.on_callback_query(filters.regex("^joined$"))
-async def joined_channel(client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    joined_users.add(user_id)
-
-    keyboard = [
+def main_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
         [InlineKeyboardButton("📂 Japanese Drama", callback_data="category_japanese")],
         [InlineKeyboardButton("📂 C Drama", callback_data="category_c_drama")],
         [InlineKeyboardButton("📂 Arabic", callback_data="category_arabic")],
-        [InlineKeyboardButton("🌐 Regional", callback_data="category_regional")],
-        [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
-    ]
-    await callback.message.edit("🎬 Welcome to K-Drama Bot! Choose a category:", reply_markup=InlineKeyboardMarkup(keyboard))
+        [InlineKeyboardButton("🌍 Regional", callback_data="category_regional")],
+        [InlineKeyboardButton("❗️ Report For Show/Episodes", callback_data="report")]
+    ])
 
-# ✅ Combined Add Show/Season Handler
-@app.on_message(filters.command(["add", "add_hindi", "add_regional", "add_jap", "add_c", "add_arb"]) & filters.user(ADMIN_ID))
+# === ALL ADMIN COMMANDS REMAIN UNCHANGED ===
+@app.on_message(filters.command(["add", "add_hindi", "add_regional", "add_jap", "add_c", "add_arb"]) & filters.user(ADMIN_ID) & filters.private)
 async def add_show(client, message):
     cmd = message.command[0]
     if len(message.command) < 2:
         return await message.reply(
-            "❗️ Usage:\n"
+            "Usage:\n"
             "/add Show Name\n"
             "/add Show Name > Category\n"
             "/add Show Name 1\n"
@@ -281,11 +441,10 @@ async def add_show(client, message):
         )
 
     args = message.text.split(" ", 1)[1].strip()
-    category = "Hindi Dubbed"  # default
+    category = "Hindi Dubbed"
     show_name = None
     season_number = None
 
-    # === SET CATEGORY BASED ON COMMAND ===
     if cmd == "add_hindi":
         category = "Hindi Dubbed"
     elif cmd == "add_regional":
@@ -297,7 +456,6 @@ async def add_show(client, message):
     elif cmd == "add_arb":
         category = "Arabic"
 
-    # === ADVANCED PARSING FOR /add ONLY ===
     if cmd == "add" and ">" in args:
         try:
             show_part, rest = args.split(">", 1)
@@ -311,7 +469,7 @@ async def add_show(client, message):
             else:
                 category = " ".join(rest).title()
         except:
-            return await message.reply("❗️ Invalid format. Use /add Show Name > Category 1")
+            return await message.reply("Invalid format. Use /add Show Name > Category 1")
     else:
         parts = args.rsplit(" ", 1)
         if parts[-1].isdigit():
@@ -322,21 +480,20 @@ async def add_show(client, message):
 
     data = load_data()
 
-    # === STRUCTURE INIT ===
     if category not in data:
         data[category] = {}
 
     if show_name not in data[category]:
         data[category][show_name] = {}
-        data[category][show_name]["poster"] = []  # ✅ Targeted change: add poster list
-
-        await message.reply(f"✅ Added show: *{show_name}* under *{category}*")
+        data[category][show_name]["poster"] = []
+        await message.reply(f"Added show: *{show_name}* under *{category}*")
 
     if season_number:
         if season_number in data[category][show_name]:
-            return await message.reply("⚠️ Season already exists.")
+            return await message.reply("Season already exists.")
         data[category][show_name][season_number] = []
-        await message.reply(f"✅ Added *Season {season_number}* under *{show_name}*")
+        await message.reply(f"Added *Season {season_number}* under *{show_name}*")
+    
     backup_database()
     save_data(data)
 
@@ -352,7 +509,7 @@ CATEGORY_ALIASES = {
     "arabic": "Arabic Drama",
     "regional": "Regional"
 }
-# 🔁 Global category alias map (normalize category names)
+
 CATEGORY_ALIASES = {
     "Hindi Dubbed": "Hindi Dubbed",
     "Regional": "Regional",
@@ -366,7 +523,7 @@ CATEGORY_ALIASES = {
     "Arabic Drama": "arb",
     "arb": "arb"
 }
-# Poster command handlers for each category
+
 POSTER_CATEGORY_COMMANDS = {
     "add_poster": "Hindi Dubbed",
     "add_poster_regional": "Regional",
@@ -376,16 +533,16 @@ POSTER_CATEGORY_COMMANDS = {
 }
 
 for cmd, category in POSTER_CATEGORY_COMMANDS.items():
-    @app.on_message(filters.command(cmd) & filters.user(ADMIN_ID))
+    @app.on_message(filters.command(cmd) & filters.user(ADMIN_ID) & filters.private)
     async def add_poster_command(client, message, category=category):
         try:
             show_name = message.text.split(" ", 1)[1].strip()
         except IndexError:
-            return await message.reply("❌ Usage: /{} Show Name".format(cmd))
+            return await message.reply("Usage: /{} Show Name".format(cmd))
 
         data = load_data()
         if category not in data or show_name not in data[category]:
-            return await message.reply(f"❌ Show *{show_name}* not found under *{category}*.")
+            return await message.reply(f"Show *{show_name}* not found under *{category}*.")
 
         poster_upload_state[message.from_user.id] = {
             "show_name": show_name,
@@ -394,8 +551,9 @@ for cmd, category in POSTER_CATEGORY_COMMANDS.items():
             "deadline": time.time() + 60
         }
 
-        await message.reply("🖼 Send 1–6 poster screenshots now (within 60 seconds)...")
-@app.on_message(filters.photo & filters.user(ADMIN_ID))
+        await message.reply("Send 1–6 poster screenshots now (within 60 seconds)...")
+
+@app.on_message(filters.photo & filters.user(ADMIN_ID) & filters.private)
 async def collect_poster(client, message):
     user_id = message.from_user.id
     state = poster_upload_state.get(user_id)
@@ -405,10 +563,10 @@ async def collect_poster(client, message):
 
     if time.time() > state["deadline"]:
         del poster_upload_state[user_id]
-        return await message.reply("⏱️ Time expired! Please run /add_poster again.")
+        return await message.reply("Time expired! Please run /add_poster again.")
 
     if len(state["file_ids"]) >= 6:
-        return await message.reply("❌ Max 6 posters allowed.")
+        return await message.reply("Max 6 posters allowed.")
 
     file_id = message.photo.file_id
     state["file_ids"].append(file_id)
@@ -416,7 +574,7 @@ async def collect_poster(client, message):
     if len(state["file_ids"]) >= 1:
         await finalize_poster_upload(client, message)
 
-@app.on_message(filters.command("done") & filters.user(ADMIN_ID))
+@app.on_message(filters.command("done") & filters.user(ADMIN_ID) & filters.private)
 async def manual_done_poster(client, message):
     user_id = message.from_user.id
     if user_id in poster_upload_state:
@@ -427,7 +585,7 @@ async def finalize_poster_upload(client, message):
     state = poster_upload_state.pop(user_id, None)
 
     if not state or not state["file_ids"]:
-        return await message.reply("❌ No posters received.")
+        return await message.reply("No posters received.")
 
     result = collection.update_one(
         {"show_name": state["show_name"], "category": state["category"]},
@@ -435,17 +593,18 @@ async def finalize_poster_upload(client, message):
     )
 
     if result.matched_count > 0:
-        await message.reply(f"✅ Poster uploaded for *{state['show_name']}*.")
+        await message.reply(f"Poster uploaded for *{state['show_name']}*.")
     else:
-        await message.reply("❌ Show not found or poster not saved.")
+        await message.reply("Show not found or poster not saved.")
+
 @app.on_message(filters.command([
     "upload", "upload_hindi", "upload_regional",
     "upload_jap", "upload_c", "upload_arb"
-]) & filters.user(ADMIN_ID))
+]) & filters.user(ADMIN_ID) & filters.private)
 async def upload_handler(client, message: Message):
     cmd = message.command[0]
     if len(message.command) < 2:
-        return await message.reply("❗️ Usage:\n"
+        return await message.reply("Usage:\n"
                                    "/upload Show Name\n"
                                    "/upload Show Name 1\n"
                                    "/upload Show Name > Category\n"
@@ -454,12 +613,10 @@ async def upload_handler(client, message: Message):
     args = message.text.split(" ", 1)[1].strip()
     data = load_data()
 
-    # Default category (used if not overridden)
     category = "Hindi Dubbed"
     show_name = None
     season_number = None
 
-    # ✅ Map shortcut commands to categories
     cmd_category_map = {
         "upload_hindi": "Hindi Dubbed",
         "upload_regional": "Regional",
@@ -470,7 +627,6 @@ async def upload_handler(client, message: Message):
     if cmd in cmd_category_map:
         category = cmd_category_map[cmd]
 
-    # ✅ Handle category inline with > symbol
     if ">" in args:
         try:
             show_part, rest = args.split(">", 1)
@@ -484,9 +640,8 @@ async def upload_handler(client, message: Message):
             else:
                 category = " ".join(rest).title()
         except:
-            return await message.reply("❗️ Invalid format. Use /upload Show Name > Category 1")
+            return await message.reply("Invalid format. Use /upload Show Name > Category 1")
     else:
-        # ✅ Handle legacy: "Show Name 1"
         parts = args.rsplit(" ", 1)
         if parts[-1].isdigit():
             show_name = parts[0].strip()
@@ -494,23 +649,21 @@ async def upload_handler(client, message: Message):
         else:
             show_name = args.strip()
 
-    # ✅ Validation: Ensure show exists
     if category not in data or show_name not in data[category]:
-        return await message.reply("❗️ Show not found. Use /add command first.")
+        return await message.reply("Show not found. Use /add command first.")
 
-    # 🔐 Split Episode Check
     if season_number:
         if season_number not in data[category][show_name]:
-            return await message.reply("❗️ Season not found. Use /add to create it first.")
+            return await message.reply("Season not found. Use /add to create it first.")
         episodes = data[category][show_name][season_number]
         if episodes and isinstance(episodes[-1], list) and None in episodes[-1]:
-            return await message.reply("⚠️ Last episode appears split and incomplete. Use /upload_split to upload parts safely.")
+            return await message.reply("Last episode appears split and incomplete. Use /upload_split to upload parts safely.")
         upload_state[message.from_user.id] = {
             "show": show_name,
             "season": season_number,
             "category": category
         }
-            # ✅ Also allow links directly after /upload
+
         if is_valid_url(message.text.strip()):
             data = load_data()
             episodes = data[category][show_name][season_number] if season_number else data[category][show_name]["episodes"]
@@ -521,30 +674,27 @@ async def upload_handler(client, message: Message):
             })
             backup_database()
             save_data(data)
-            return await message.reply("🔗 Link episode saved successfully.")
+            return await message.reply("Link episode saved successfully.")
 
-        return await message.reply(f"📤 Send videos now for *{show_name}* Season *{season_number}*", quote=True)
+        return await message.reply(f"Send videos now for *{show_name}* Season *{season_number}*", quote=True)
     
     else:
         flat_eps = data[category][show_name]["episodes"]
         if flat_eps and isinstance(flat_eps[-1], list):
-            return await message.reply("⚠️ Last episode appears split. Use /upload_split to upload parts safely.")
+            return await message.reply("Last episode appears split. Use /upload_split to upload parts safely.")
         
         upload_state[message.from_user.id] = {
             "show": show_name,
             "season": None,
             "category": category
         }
-        return await message.reply(f"📤 Send videos now for *{show_name}*", quote=True)
+        return await message.reply(f"Send videos now for *{show_name}*", quote=True)
 
-
-
-# ===== FIXED VIDEO SAVING =====
-@app.on_message(filters.video & filters.user(ADMIN_ID))
+@app.on_message(filters.video & filters.user(ADMIN_ID) & filters.private)
 async def handle_video(client, message: Message):
     user_id = message.from_user.id
     if user_id not in upload_state:
-        return await message.reply("⚠️ First use /upload ShowName or /upload ShowName SeasonNumber")
+        return await message.reply("First use /upload ShowName or /upload ShowName SeasonNumber")
 
     state = upload_state[user_id]
     show_name = state["show"]
@@ -552,33 +702,27 @@ async def handle_video(client, message: Message):
     category = state["category"]
 
     try:
-        # ✅ Forward to storage channel
         fwd = await message.forward(STORAGE_CHANNEL_ID, disable_notification=True)
         file_id = fwd.video.file_id
-
-        # ✅ NEW: delete from storage channel to keep chat invisible
         await fwd.delete()
 
-        # ✅ Save to MongoDB in correct category path
         data = load_data()
 
         if "split_index" in state:
-            # 🔥 Uploading to a split episode
             split_index = state["split_index"]
             part = state["part"]
 
             episodes = data[category][show_name][season_number]
             if not isinstance(episodes[split_index], list):
-                return await message.reply("❌ Target episode is not split. Use /split_episode first.")
+                return await message.reply("Target episode is not split. Use /split_episode first.")
 
-            # Ensure list has space for two parts
             while len(episodes[split_index]) <= part:
                 episodes[split_index].append(None)
 
             episodes[split_index][part] = file_id
             backup_database()
             save_data(data)
-            return await message.reply(f"✅ Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
+            return await message.reply(f"Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
 
         episode_data = {
             "type": "video",
@@ -593,15 +737,15 @@ async def handle_video(client, message: Message):
         save_data(data)
 
         await message.reply(
-            f"✅ Uploaded and saved for *{show_name}*{' Season ' + season_number if season_number else ''}.",
+            f"Uploaded and saved for *{show_name}*{' Season ' + season_number if season_number else ''}.",
             quote=True
         )
 
     except Exception as e:
         print("Upload error:", e)
-        await message.reply("❌ Failed to upload. Please check bot permissions or channel ID.")
+        await message.reply("Failed to upload. Please check bot permissions or channel ID.")
 
-
+# === Continue with all other existing handlers but add filters.private ===
 @app.on_callback_query(filters.regex("^multi_"))
 async def multi_part_episode_menu(client, callback: CallbackQuery):
     try:
@@ -611,7 +755,7 @@ async def multi_part_episode_menu(client, callback: CallbackQuery):
 
         multi_parts = data[category][show_name][season_or_key][index]
         if not isinstance(multi_parts, list) or len(multi_parts) != 2:
-            return await callback.answer("⚠️ Multi-part not found.")
+            return await callback.answer("Multi-part not found.")
 
         buttons = [
             [InlineKeyboardButton("▶️ Episode", callback_data=f"mp_ep_{category}_{show_name}_{season_or_key}_{index}_0")],
@@ -625,7 +769,7 @@ async def multi_part_episode_menu(client, callback: CallbackQuery):
 
     except Exception as e:
         print("Multi-part submenu error:", e)
-        await callback.answer("❌ Error showing split parts.")
+        await callback.answer("Error showing split parts.")
 
 @app.on_callback_query(filters.regex("^mp_ep_"))
 async def send_multi_part_episode(client, callback: CallbackQuery):
@@ -639,16 +783,13 @@ async def send_multi_part_episode(client, callback: CallbackQuery):
         caption = f"🎬 {show_name} - Episode {index + 1}{'.5' if part == 1 else ''}"
         sent = await client.send_video(chat_id=callback.from_user.id, video=file_id, caption=caption)
 
-        await callback.answer("✅ Sent! Auto-delete in 3 mins.")
+        await callback.answer("Sent! Auto-delete in 3 mins.")
         await asyncio.sleep(180)
         await sent.delete()
 
     except Exception as e:
         print("Multi-part send error:", e)
-        await callback.answer("❌ Couldn't send episode.")
-
-
-
+        await callback.answer("Couldn't send episode.")
 
 @app.on_callback_query(filters.regex("^season_(.+?)_(.+?)_(.+)$"))
 async def season_menu(client, callback_query):
@@ -687,7 +828,6 @@ async def season_menu(client, callback_query):
 
     await callback_query.answer()
 
-
 @app.on_callback_query(filters.regex("^show_(.+?)_(.+)$"))
 async def show_menu(client, callback_query):
     category, show_name = callback_query.data.split("_", 2)[1:]
@@ -700,13 +840,12 @@ async def show_menu(client, callback_query):
     buttons = []
     episodes = data[category][show_name]
 
-    # Handle flat episodes
     if "episodes" in episodes:
         for idx, ep in enumerate(episodes["episodes"], start=1):
-            if isinstance(ep, list):  # split episode
+            if isinstance(ep, list):
                 buttons.append([
                     InlineKeyboardButton(
-                        f"📁 Episode {idx} (split)",
+                        f"📂 Episode {idx} (split)",
                         callback_data=f"multi_{category}_{show_name}_episodes_{idx}"
                     )
                 ])
@@ -718,12 +857,11 @@ async def show_menu(client, callback_query):
                     )
                 ])
 
-    # Handle seasons
     for season in episodes:
         if season not in ["episodes", "poster"]:
             buttons.append([
                 InlineKeyboardButton(
-                    f"📁 Season {season}",
+                    f"📂 Season {season}",
                     callback_data=f"season_{category}_{show_name}_{season}"
                 )
             ])
@@ -750,8 +888,7 @@ async def show_menu(client, callback_query):
 
     await callback_query.answer()
 
-
-@app.on_message(filters.photo & filters.user(ADMIN_ID))
+@app.on_message(filters.photo & filters.user(ADMIN_ID) & filters.private)
 async def handle_poster_photo(client, message: Message):
     user_id = message.from_user.id
     if user_id not in poster_upload_state:
@@ -759,51 +896,46 @@ async def handle_poster_photo(client, message: Message):
     
     state = poster_upload_state[user_id]
     
-    # Check if we've reached the max posters (6)
     if len(state["file_ids"]) >= 6:
-        return await message.reply("❌ Maximum 6 posters allowed. Use /add_poster again if needed.")
+        return await message.reply("Maximum 6 posters allowed. Use /add_poster again if needed.")
     
-    # Forward to storage channel and get file_id
     try:
         fwd = await message.forward(STORAGE_CHANNEL_ID, disable_notification=True)
         state["file_ids"].append(fwd.photo.file_id)
-        await fwd.delete()  # Clean up storage channel
+        await fwd.delete()
         
         remaining = 6 - len(state["file_ids"])
         if remaining > 0:
-            await message.reply(f"🖼 Poster received ({len(state['file_ids'])}/6). Send more or wait to auto-finalize.")
+            await message.reply(f"Poster received ({len(state['file_ids'])}/6). Send more or wait to auto-finalize.")
         else:
             await finalize_poster_upload(client, message)
             
     except Exception as e:
         print("Poster upload error:", e)
-        await message.reply("❌ Failed to process poster.")
+        await message.reply("Failed to process poster.")
 
-
-@app.on_message(filters.command(["split_hindi", "split_jap", "split_c", "split_arb"]) & filters.user(ADMIN_ID))
+@app.on_message(filters.command(["split_hindi", "split_jap", "split_c", "split_arb"]) & filters.user(ADMIN_ID) & filters.private)
 async def split_episode_command(client, message: Message):
     try:
         cmd = message.command[0]
         if len(message.command) < 2 or "/" not in message.text:
             return await message.reply(
-                "❗️ Usage:\n"
+                "Usage:\n"
                 "/split_hindi Show Name Season No/Episode No\n"
                 "/split_jap Show Name Season No/Episode No\n"
                 "/split_c Show Name Season No/Episode No\n"
                 "/split_arb Show Name Season No/Episode No"
             )
 
-        # Extracting the information
         args = message.text.split(" ", 1)[1].strip()
         left, episode_part = args.rsplit("/", 1)
-        episode_num = int(episode_part.strip())  # e.g., 1
-        episode_index = episode_num - 1  # Python index adjustment
+        episode_num = int(episode_part.strip())
+        episode_index = episode_num - 1
 
         tokens = left.strip().split()
         show_name = " ".join(tokens[:-1]) if tokens[-1].isdigit() else " ".join(tokens)
         season_number = tokens[-1] if tokens[-1].isdigit() else None
 
-        # Mapping command to categories
         cmd_category_map = {
             "split_hindi": "Hindi Dubbed",
             "split_jap": "Japanese Drama",
@@ -815,40 +947,36 @@ async def split_episode_command(client, message: Message):
         data = load_data()
 
         if category not in data or show_name not in data[category]:
-            return await message.reply("❌ Show not found in the selected category.")
+            return await message.reply("Show not found in the selected category.")
 
-        # Determine the episodes list based on season or flat
         episodes = (
             data[category][show_name].get(season_number)
             if season_number else data[category][show_name].get("episodes")
         )
         
         if not episodes:
-            return await message.reply("❌ No episodes found for the selected show.")
+            return await message.reply("No episodes found for the selected show.")
         
-        # Split the episode
         if episode_index < 0 or episode_index >= len(episodes):
-            return await message.reply("❌ Episode index out of range.")
+            return await message.reply("Episode index out of range.")
 
         original = episodes[episode_index]
 
-        # Check if it's already split
         if isinstance(original, list):
-            return await message.reply("⚠️ Episode is already split.")
+            return await message.reply("Episode is already split.")
 
-        # Mark the episode as split (into part 1 and part 2)
         episodes[episode_index] = [original, None]
         backup_database()
         save_data(data)
 
         label = f"{episode_num} (S{season_number})" if season_number else f"{episode_num}"
-        return await message.reply(f"✅ Episode {label} is now split into two parts (waiting for part 2).")
+        return await message.reply(f"Episode {label} is now split into two parts (waiting for part 2).")
 
     except Exception as e:
         print("[split_episode_command] error:", e)
-        return await message.reply("❌ Failed to process split episode.")
+        return await message.reply("Failed to process split episode.")
     
-@app.on_message(filters.command(["upload_split_hindi", "upload_split_regional", "upload_split_jap", "upload_split_c", "upload_split_arb"]) & filters.user(ADMIN_ID))
+@app.on_message(filters.command(["upload_split_hindi", "upload_split_regional", "upload_split_jap", "upload_split_c", "upload_split_arb"]) & filters.user(ADMIN_ID) & filters.private)
 async def upload_split_handler(client, message: Message):
     try:
         cmd = message.command[0]
@@ -862,32 +990,32 @@ async def upload_split_handler(client, message: Message):
         category = cmd_category_map[cmd]
 
         if len(message.command) < 2:
-            return await message.reply("❗️ Usage:\n/upload_split_hindi Show Season Episode Part")
+            return await message.reply("Usage:\n/upload_split_hindi Show Season Episode Part")
 
         args = message.text.split(" ", 1)[1].strip().split()
         if len(args) < 4:
-            return await message.reply("❌ Format error. Provide Show, Season, Episode, Part")
+            return await message.reply("Format error. Provide Show, Season, Episode, Part")
 
         show_name = " ".join(args[:-3])
         season = args[-3]
         episode = int(args[-2])
-        part_index = int(args[-1]) - 1  # 0 or 1
+        part_index = int(args[-1]) - 1
 
         if part_index not in (0, 1):
-            return await message.reply("❌ Part must be 1 or 2")
+            return await message.reply("Part must be 1 or 2")
 
         data = load_data()
 
         if category not in data or show_name not in data[category]:
-            return await message.reply("❌ Show not found.")
+            return await message.reply("Show not found.")
         if season not in data[category][show_name]:
-            return await message.reply("❌ Season not found.")
+            return await message.reply("Season not found.")
 
         episodes = data[category][show_name][season]
         if episode < 1 or episode > len(episodes):
-            return await message.reply("❌ Episode index out of range.")
+            return await message.reply("Episode index out of range.")
         if not isinstance(episodes[episode - 1], list):
-            return await message.reply("❌ Episode not marked as split. Use /split_hindi first.")
+            return await message.reply("Episode not marked as split. Use /split_hindi first.")
 
         upload_state[message.from_user.id] = {
             "show": show_name,
@@ -898,36 +1026,29 @@ async def upload_split_handler(client, message: Message):
         }
 
         return await message.reply(
-            f"📤 Send video for *{show_name}* S{season} Ep {episode} Part {part_index + 1}"
+            f"Send video for *{show_name}* S{season} Ep {episode} Part {part_index + 1}"
         )
     except Exception as e:
         print("[upload_split_handler] error:", e)
-        return await message.reply("❌ Failed to process upload split.")
+        return await message.reply("Failed to process upload split.")
 
-async def send_poster_if_exists(client, chat_id, show_name, category):
-    doc = collection.find_one({"show_name": show_name, "category": category})
-    posters = doc.get("poster", []) if doc else []
-    for file_id in posters:
-        await client.send_photo(chat_id, file_id)
-    
 @app.on_callback_query(filters.regex("^noop$"))
 async def do_nothing(client, callback_query: CallbackQuery):
     await callback_query.answer("Nothing to show here.")
 
-
 @app.on_callback_query(filters.regex("^multi_"))
 async def split_parts_view(client, callback_query):
     try:
-        _, category, show_name, key, index = callbacks.data.split("_", 4)
+        _, category, show_name, key, index = callback_query.data.split("_", 4)
         index = int(index) - 1
         data = load_data()
 
         if show_name not in data[category] or key not in data[category][show_name]:
-            return await callback_query.answer("❌ Not found.")
+            return await callback_query.answer("Not found.")
 
         parts = data[category][show_name][key][index]
         if not isinstance(parts, list):
-            return await callback_query.answer("❌ Not a split episode.")
+            return await callback_query.answer("Not a split episode.")
 
         buttons = []
         if parts[0]:
@@ -941,31 +1062,28 @@ async def split_parts_view(client, callback_query):
         )
     except Exception as e:
         print("split_parts_view error:", e)
-        await callback_query.answer("⚠️ Error opening split episode.")
+        await callback_query.answer("Error opening split episode.")
 
-
-@app.on_message(filters.command("list") & filters.user(ADMIN_ID))
+@app.on_message(filters.command("list") & filters.user(ADMIN_ID) & filters.private)
 async def list_content(client, message):
     data = load_data()
-    output = "📋 Available Shows:\n"
-    for show_name, seasons in data.items():
-        output += f"- {show_name}\n"
-        if "episodes" in seasons:
-            output += "  - Episodes\n"
-        for season_number, episodes in seasons.items():
-            if season_number != "episodes":
-                output += f"  - Season {season_number}\n"
-                for idx in range(len(episodes)):
-                    output += f"    - Episode {idx + 1}\n"
+    output = "Available Shows:\n"
+    for category in data:
+        output += f"- {category}\n"
+        for show_name, seasons in data[category].items():
+            output += f"  - {show_name}\n"
+            if "episodes" in seasons:
+                output += "    - Episodes\n"
+            for season_number, episodes in seasons.items():
+                if season_number not in ["episodes", "poster"]:
+                    output += f"    - Season {season_number}\n"
     await message.reply(output)
 
-
-
-@app.on_message(filters.command("get_links") & filters.user(ADMIN_ID))
+@app.on_message(filters.command("get_links") & filters.user(ADMIN_ID) & filters.private)
 async def get_links(client, message):
     data = load_data()
     if not data:
-        return await message.reply("❌ No shows found.")
+        return await message.reply("No shows found.")
 
     bot_username = (await client.get_me()).username
     links = []
@@ -973,186 +1091,144 @@ async def get_links(client, message):
 
     for category in data:
         for show_name, content in data[category].items():
-            # Skip if it's a nested season inside another show (not valid show)
             if not isinstance(content, dict):
                 continue
 
-            # Only generate once per unique show name
             if show_name in added:
                 continue
 
             slug = f"{category.replace(' ', '_')}__{show_name.replace(' ', '_')}"
             link = f"https://t.me/{bot_username}?start={slug}"
-            links.append(f"🔗 [{show_name} ({category})]({link})")
+            links.append(f"[{show_name} ({category})]({link})")
             added.add(show_name)
 
     await message.reply(
-        "**🎬 Direct Show Links:**\n\n" + "\n".join(links),
+        "**Direct Show Links:**\n\n" + "\n".join(links),
         disable_web_page_preview=True
     )
 
-
-# === Help Command (Updated) ===
-@app.on_message(filters.command("help"))
+@app.on_message(filters.command("help") & filters.private)
 async def help_command(client, message):
     is_admin = message.from_user.id == ADMIN_ID
 
     admin_help = """
-📘 ADMIN COMMANDS PANEL
+ADMIN COMMANDS PANEL
 
-━━━━━━━━━━━━━━━
-📁 ADD SHOWS/SEASONS
-━━━━━━━━━━━━━━━
-
-🔸 Hindi Dubbed:
+ADD SHOWS/SEASONS
+Hindi Dubbed:
   /add_hindi Show Name
   /add Show Name > Hindi Dubbed
-  /add Show Name > Hindi Dubbed Season
 
-🔸 Regional:
+Regional:
   /add_regional Show Name
   /add Show Name > Regional
-  /add Show Name > Regional Season
 
-🔸 Japanese Drama:
+Japanese Drama:
   /add_jap Show Name
   /add Show Name > Japanese Drama
-  /add Show Name > Japanese Drama Season
 
-🔸 C Drama:
+C Drama:
   /add_c Show Name
   /add Show Name > C Drama
-  /add Show Name > C Drama Season
 
-🔸Arabic:
+Arabic:
   /add_arb Show Name
   /add Show Name > Arabic
-  /add Show Name > Arabic Season
 
-🔸 🖼 Poster Upload Commands:
- /add_poster Show Name– Hindi Dubbed
- /add_poster_regional Show Name– Regional
- /add_poster_jap Show Name– Japanese
- /add_poster_c Show Name– Chinese
- /add_poster_arb Show Name– Arabic
-━━━━━━━━━━━━━━━
-📤 UPLOAD VIDEOS
-━━━━━━━━━━━━━━━
+Poster Upload Commands:
+ /add_poster Show Name— Hindi Dubbed
+ /add_poster_regional Show Name— Regional
+ /add_poster_jap Show Name— Japanese
+ /add_poster_c Show Name— Chinese
+ /add_poster_arb Show Name— Arabic
 
-🔸 Hindi Dubbed:
+UPLOAD VIDEOS
+Hindi Dubbed:
   /upload_hindi Show Name
   /upload Show Name > Hindi Dubbed
-  /upload Show Name > Hindi Dubbed Season
 
-🔸 Regional:
+Regional:
   /upload_regional Show Name
   /upload Show Name > Regional
-  /upload Show Name > Regional Season
 
-🔸 Japanese Drama:
+Japanese Drama:
   /upload_jap Show Name
   /upload Show Name > Japanese Drama
-  /upload Show Name > Japanese Drama Season
 
-🔸 C Drama:
+C Drama:
   /upload_c Show Name
   /upload Show Name > C Drama
-  /upload Show Name > C Drama Season
 
-🔸 Arabic:
+Arabic:
   /upload_arb Show Name
   /upload Show Name > Arabic
-  /upload Show Name > Arabic Season
 
-━━━━━━━━━━━━━━━
-🎬 SPLIT & UPLOAD SPLIT PARTS
-━━━━━━━━━━━━━━━
-
-🔸 Split Episodes:
+SPLIT & UPLOAD SPLIT PARTS
+Split Episodes:
   /split_episode Show Name /EpNo > Category
-  (e.g. /split_episode Tokyo Love /3 > Japanese Drama)
 
-🔸 Upload Split Episodes:
+Upload Split Episodes:
   /upload_split_hindi Show Season Ep Part
   /upload_split_regional Show Season Ep Part
   /upload_split_jap Show Season Ep Part
   /upload_split_c Show Season Ep Part
   /upload_split_arb Show Season Ep Part
 
-━━━━━━━━━━━━━━━
-🧹 Delete Commands:
-
-🟥 Hindi Dubbed
+Delete Commands:
+Hindi Dubbed
 /delete Show Name
 /delete Show Name Season
 /delete Show Name Season /Episode
-/delete Show Name Season /SplitEpisode
 
-🟦 Regional
+Regional
 /delete_regional Show Name
 /delete_regional Show Name Season
 /delete_regional Show Name Season /Episode
-/delete_regional Show Name Season /SplitEpisode
 
-🟨 Japanese Drama
+Japanese Drama
 /delete_jap Show Name
 /delete_jap Show Name Season
 /delete_jap Show Name Season /Episode
-/delete_jap Show Name Season /SplitEpisode
 
-🟩 C Drama
+C Drama
 /delete_c Show Name
 /delete_c Show Name Season
 /delete_c Show Name Season /Episode
-/delete_c Show Name Season /SplitEpisode
 
-🟧 Arabic
+Arabic
 /delete_arb Show Name
 /delete_arb Show Name Season
 /delete_arb Show Name Season /Episode
-/delete_arb Show Name Season /SplitEpisode
 
-
-━━━━━━━━━━━━━━━
-🛠 UTILITIES
-━━━━━━━━━━━━━━━
-/add_poster S line  > regional
-
-
-  /get_links – Get shareable links
-  /list – Display all shows & structure
-  /test_forward – Check forwarding
-  /report – Handle user reports
-  /add_poster Mercy for None > Hindi Dubbed
-
-━━━━━━━━━━━━━━━
-🔗 CHANNEL
-━━━━━━━━━━━━━━━
-https://t.me/KDRAMAAVIL
+UTILITIES
+  /get_links — Get shareable links
+  /list — Display all shows & structure
+  /test_forward — Check forwarding
+  /report — Handle user reports
 """
 
     user_help = """
-👤 USER COMMANDS
+USER COMMANDS
 
 - Use buttons to browse and stream shows
 - Videos auto-delete after 3 minutes
 - Use /report to request missing episodes
-- Updates: [Join Channel](https://t.me/KDRAMAAVIL)
+- Updates: Join Channel
 """
 
     await message.reply(admin_help if is_admin else user_help, disable_web_page_preview=True)
+
 @app.on_message(filters.command([
     "delete", "delete_regional", "delete_jap", "delete_c", "delete_arb"
-]) & filters.user(ADMIN_ID))
+]) & filters.user(ADMIN_ID) & filters.private)
 async def delete_content(client, message: Message):
     try:
         cmd = message.command[0]
         if len(message.command) < 2:
-            return await message.reply("❗️ Usage:\n/delete Show\n/delete Show Season\n/delete Show /Episode\n/delete Show Season /Episode")
+            return await message.reply("Usage:\n/delete Show\n/delete Show Season\n/delete Show /Episode\n/delete Show Season /Episode")
 
         args = message.text.split(" ", 1)[1].strip()
 
-        # 🔁 Detect episode deletion like /delete Show /3 (season-less)
         if " /" in args:
             show_part, ep_str = args.rsplit("/", 1)
             show_name = show_part.strip()
@@ -1178,8 +1254,6 @@ async def delete_content(client, message: Message):
                 season = None
             episode_index = None
 
-        # 🔎 Determine category
-        # 🔎 Determine category
         cmd_category_map = {
             "delete": "Hindi Dubbed",
             "delete_regional": "Regional",
@@ -1192,63 +1266,51 @@ async def delete_content(client, message: Message):
         data = load_data()
 
         if show_name not in data.get(category, {}):
-            return await message.reply(f"❌ Show not found in *{category}*")
+            return await message.reply(f"Show not found in *{category}*")
 
-        # === Handle full show deletion ===
         if season is None and episode_index is None:
             del data[category][show_name]
-            collection.delete_one({"category": category, "show_name": show_name})  # ✅ Actually remove from DB
+            collection.delete_one({"category": category, "show_name": show_name})
             backup_database()
             save_data(data)
-            return await message.reply(f"✅ Deleted *{show_name}* from *{category}*")
+            return await message.reply(f"Deleted *{show_name}* from *{category}*")
 
-        # === Handle season deletion ===
-        # === Handle season deletion ===
         if season and episode_index is None:
             if season not in data[category][show_name]:
-                return await message.reply("❌ Season not found.")
+                return await message.reply("Season not found.")
 
-            # ✅ Delete from memory
             del data[category][show_name][season]
-
-            # ✅ Update DB to remove that season
             collection.update_one(
                 {"category": category, "show_name": show_name},
                 {"$unset": {f"episodes.{season}": ""}}
             )
-
             backup_database()
             save_data(data)
-            return await message.reply(f"✅ Deleted *Season {season}* from *{show_name}*")
+            return await message.reply(f"Deleted *Season {season}* from *{show_name}*")
 
-        # === Handle episode deletion ===
-        # === Handle episode deletion ===
         key = season if season else "episodes"
         if key not in data[category][show_name]:
-            return await message.reply("❌ Season or episode list not found.")
+            return await message.reply("Season or episode list not found.")
 
         episodes = data[category][show_name][key]
         if not isinstance(episodes, list):
-            return await message.reply("❌ This season/section doesn't contain a list of episodes.")
+            return await message.reply("This season/section doesn't contain a list of episodes.")
 
         if episode_index < 0 or episode_index >= len(episodes):
-            return await message.reply("❌ Episode index out of range.")
+            return await message.reply("Episode index out of range.")
 
-        # ✅ Delete episode from memory
         del episodes[episode_index]
-
-        # ✅ Save updated episodes to MongoDB
         collection.update_one(
             {"category": category, "show_name": show_name},
             {"$set": {f"episodes.{key}": episodes}}
         )
-
         backup_database()
         save_data(data)
-        return await message.reply(f"✅ Deleted Episode {episode_index + 1} from *{show_name}* {f'Season {season}' if season else ''}")
+        return await message.reply(f"Deleted Episode {episode_index + 1} from *{show_name}* {f'Season {season}' if season else ''}")
     except Exception as e:
-        print("❌ Delete Error:", e)
-        return await message.reply("⚠️ Something went wrong while deleting.")
+        print("Delete Error:", e)
+        return await message.reply("Something went wrong while deleting.")
+
 @app.on_callback_query(filters.regex("^episode_"))
 async def send_episode(client, callback_query: CallbackQuery):
     try:
@@ -1256,7 +1318,7 @@ async def send_episode(client, callback_query: CallbackQuery):
         parts = payload.split("_")
 
         if len(parts) < 4:
-            return await callback_query.answer("❌ Invalid episode data.")
+            return await callback_query.answer("Invalid episode data.")
 
         category = parts[0]
         index_str = parts[-1]
@@ -1265,26 +1327,23 @@ async def send_episode(client, callback_query: CallbackQuery):
         show_name = "_".join(show_name_parts)
         index = int(index_str) - 1
         data = load_data()
-        
-
 
         if show_name not in data.get(category, {}):
-            return await callback_query.answer("❌ Show not found.")
+            return await callback_query.answer("Show not found.")
 
         if season_or_key not in data[category][show_name]:
-            return await callback_query.answer("❌ Season or episode list not found.")
+            return await callback_query.answer("Season or episode list not found.")
         
         if season_or_key == "poster":
-            return await callback_query.answer("⚠️ Poster is not an episode.")
+            return await callback_query.answer("Poster is not an episode.")
 
         episode_list = data[category][show_name][season_or_key]
 
         if index < 0 or index >= len(episode_list):
-            return await callback_query.answer("❌ Episode index out of range.")
+            return await callback_query.answer("Episode index out of range.")
 
         episode_data = episode_list[index]
 
-        # ✅ Check if it's a split episode
         if isinstance(episode_data, list):
             buttons = []
             for i, part_file_id in enumerate(episode_data):
@@ -1296,14 +1355,12 @@ async def send_episode(client, callback_query: CallbackQuery):
                         )
                     ])
             if not buttons:
-                return await callback_query.answer("⚠️ Split parts not uploaded yet.")
+                return await callback_query.answer("Split parts not uploaded yet.")
             return await callback_query.message.edit_text(
                 f"🎬 {show_name.replace('_', ' ')} - Episode {index+1} (Split)",
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
 
-        # Normal full episode
-        # Handle old plain string format
         if isinstance(episode_data, str):
             episode_data = { "type": "video", "content": episode_data }
 
@@ -1313,7 +1370,7 @@ async def send_episode(client, callback_query: CallbackQuery):
                 video=episode_data["content"],
                 caption=f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}"
             )
-            await callback_query.answer("✅ Sent video. It will auto-delete in 3 minutes.")
+            await callback_query.answer("Sent video. It will auto-delete in 3 minutes.")
             await asyncio.sleep(180)
             await sent_msg.delete()
 
@@ -1322,24 +1379,19 @@ async def send_episode(client, callback_query: CallbackQuery):
                 chat_id=callback_query.from_user.id,
                 text=(
                     f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}\n"
-                    f"📥 Download Link 👇"
+                    f"Download Link"
                 ),
                 reply_markup=InlineKeyboardMarkup([[ 
                     InlineKeyboardButton("▶ Watch Episode", url=episode_data["content"])
                 ]]),
                 disable_web_page_preview=False
             )
-            await callback_query.answer("✅ Sent link.")
-            return  # prevent fallthrough to final video logic
-
-
-        await callback_query.answer("✅ Sent video. It will auto-delete in 3 minutes.")
-        await asyncio.sleep(180)
-        await sent_msg.delete()
+            await callback_query.answer("Sent link.")
+            return
 
     except Exception as e:
         print(f"[send_episode] ERROR: {e}")
-        await callback_query.answer("⚠️ Error while sending episode.")
+        await callback_query.answer("Error while sending episode.")
 
 @app.on_callback_query(filters.regex("^splitpart_"))
 async def send_split_part(client, callback_query: CallbackQuery):
@@ -1347,7 +1399,7 @@ async def send_split_part(client, callback_query: CallbackQuery):
         payload = callback_query.data[len("splitpart_"):]
         parts = payload.split("_")
         if len(parts) < 5:
-            return await callback_query.answer("❌ Invalid split part data.")
+            return await callback_query.answer("Invalid split part data.")
 
         category, *name_parts, season_or_key, ep_index_str, part_index_str = parts
         show_name = "_".join(name_parts)
@@ -1362,177 +1414,112 @@ async def send_split_part(client, callback_query: CallbackQuery):
             video=file_id,
             caption=f"🎬 {show_name.replace('_', ' ')} - Part {part_index + 1}"
         )
-        await callback_query.answer("✅ Sent part. Auto-deletes in 3 minutes.")
+        await callback_query.answer("Sent part. Auto-deletes in 3 minutes.")
         await asyncio.sleep(180)
         await sent_msg.delete()
 
     except Exception as e:
         print(f"[send_split_part] ERROR: {e}")
-        await callback_query.answer("⚠️ Could not send split part.")
+        await callback_query.answer("Could not send split part.")
 
-@app.on_callback_query(filters.regex("^play_"))
-async def play_split_part(client, callback_query: CallbackQuery):
-    try:
-        _, category, show_name, season_or_key, index_str, part_str = callback_query.data.split("_", 5)
-        index = int(index_str)
-        part = int(part_str)
-
-        data = load_data()
-        episodes = data.get(category, {}).get(show_name, {}).get(season_or_key)
-        episode = episodes[index]
-        file_id = episode[part]
-
-        if not file_id:
-            return await callback_query.answer(f"❌ Part {part+1} not uploaded yet.")
-
-        sent_msg = await client.send_video(
-            chat_id=callback_query.from_user.id,
-            video=file_id,
-            caption=f"🎬 {show_name.replace('_', ' ')} - Episode {index+1} Part {part+1}"
-        )
-        await callback_query.answer("✅ Sent part. Will auto-delete in 3 minutes.")
-        await asyncio.sleep(180)
-        await sent_msg.delete()
-
-    except Exception as e:
-        print(f"[play_split_part] ERROR: {e}")
-        await callback_query.answer("⚠️ Error while sending part.")
-
-@app.on_message(filters.command("test_forward"))
+@app.on_message(filters.command("test_forward") & filters.user(ADMIN_ID) & filters.private)
 async def test_forward(client, message):
     try:
-        # Attempt to forward a test message to the storage channel
         await client.forward_messages(
             chat_id=STORAGE_CHANNEL_ID,
             from_chat_id=message.chat.id,
             message_ids=message.message_id,
             disable_notification=True
         )
-        await message.reply("✅ Forwarding successful!")
+        await message.reply("Forwarding successful!")
     except Exception as e:
-        await message.reply(f"❌ Error forwarding: {e}")
+        await message.reply(f"Error forwarding: {e}")
 
 @app.on_callback_query(filters.regex("^report$"))
 async def handle_report(client, callback_query: CallbackQuery):
-    # Edit the message to prompt the user to type the name of the missing show/episode
-    await callback_query.message.edit("✍️ Please type the name of the missing show/episode.")
-    return
+    await callback_query.message.edit("Please type the name of the missing show/episode.")
 
-
-
-
-# === USER REPORT HANDLER ===
-@app.on_message(filters.text & ~filters.command(["start", "help", "add", "upload", "delete"]) & ~filters.user(ADMIN_ID))
+@app.on_message(filters.text & ~filters.command(["start", "help", "add", "upload", "delete"]) & ~filters.user(ADMIN_ID) & filters.private)
 async def handle_user_report(client, message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
 
     if not text:
-        return await message.reply("❗ Empty message, Please Enter your report.")
+        return await message.reply("Empty message, Please Enter your report.")
 
     try:
-        # ✅ send report to admin with inline reply button
         report_msg = await client.send_message(
             ADMIN_ID,
-            f"📩 New Report from `{user_id}`:\n\n{message.text}",
+            f"New Report from `{user_id}`:\n\n{message.text}",
             reply_markup=InlineKeyboardMarkup([[ 
-                InlineKeyboardButton("💬 Reply", callback_data=f"reply_to_{user_id}")
+                InlineKeyboardButton("Reply", callback_data=f"reply_to_{user_id}")
             ]])
         )
         
-        # ✅ save users id using admin message id
         REPORTS[str(report_msg.message_id)] = user_id
-
-        # ✅ Confirm to the user
-        await message.reply("✅ Report sent! the admin will reply soon if needed ")
+        await message.reply("Report sent! The admin will reply soon if needed.")
     
     except Exception as e:
-        # if anything falls 
-        await message.reply("❌ Failed to send report. Please try again later.")
+        await message.reply("Failed to send report. Please try again later.")
         print("[handle_users_report] Error:", e)
-        return
-      
 
-
-
-
-
-
-# === BUTTON REPLY FROM ADMIN ===
 @app.on_callback_query(filters.regex("^reply_to_"))
 async def handle_reply_button(client, callback: CallbackQuery):
     try:
         user_id = int(callback.data.split("_")[2])
         reply_waiting[callback.from_user.id] = user_id
-        await callback.message.reply("✍️ Send your reply now. It will be forwarded to the user.")
+        await callback.message.reply("Send your reply now. It will be forwarded to the user.")
         await callback.answer()
      
     except Exception as e:
         print("[reply_to_] Error:", e)
-        await callback.answer("⚠️ Failed to initiate reply.")
+        await callback.answer("Failed to initiate reply.")
 
-
-@app.on_message(filters.text & ~filters.regex(r"^/\w+") & filters.user(ADMIN_ID))
-async def handle_link(client, message: Message):
+@app.on_message(filters.text & filters.user(ADMIN_ID) & filters.private)
+async def handle_admin_messages(client, message: Message):
     user_id = message.from_user.id
-    if user_id not in upload_state:
-        return  # not in upload mode
+    
+    # Check if admin is in reply mode
+    target_id = reply_waiting.get(user_id)
+    if target_id:
+        try:
+            await client.send_message(
+                target_id,
+                f"Admin replied to your report:\n\n{message.text}"
+            )
+            await message.reply("Your reply has been sent to the user.")
+            del reply_waiting[user_id]
+        except Exception as e:
+            await message.reply(f"Failed to send reply: {e}")
+        return
+    
+    # Check if admin is in upload mode and sending links
+    if user_id in upload_state:
+        url = message.text.strip()
+        if is_valid_url(url):
+            state = upload_state[user_id]
+            show = state["show"]
+            season = state["season"]
+            category = state["category"]
+            
+            data = load_data()
+            
+            if season:
+                data[category][show].setdefault(season, []).append({
+                    "type": "link",
+                    "content": url
+                })
+            else:
+                data[category][show].setdefault("episodes", []).append({
+                    "type": "link",
+                    "content": url
+                })
+            backup_database()
+            save_data(data)
+            await message.reply("Link episode saved successfully.")
+            return
 
-    from re import match
-
-    url = message.text.strip()
-    if not match(r"^https?://", url):
-        return  # not a link
-
-    state = upload_state[user_id]
-    show = state["show"]
-    season = state["season"]
-    category = state["category"]
-
-    data = load_data()
-
-    if season:
-        data[category][show].setdefault(season, []).append({
-            "type": "link",
-            "content": url
-        })
-    else:
-        data[category][show].setdefault("episodes", []).append({
-            "type": "link",
-            "content": url
-        })
-    backup_database()
-    save_data(data)
-    await message.reply("🔗 Link episode saved successfully.")
-
-# === ACTUAL REPLY FROM ADMIN ===
-@app.on_message(filters.text & filters.user(ADMIN_ID))
-async def admin_reply_to_user(client, message: Message):
-    admin_id = message.from_user.id
-    target_id = reply_waiting.get(admin_id)
-
-    if not target_id:
-        return  # Ignore regular admin messages not linked to a reply
-
-    try:
-        await client.send_message(
-            target_id,
-            f"📢 Admin replied to your report:\n\n{message.text}"
-        )
-        await message.reply("✅ Your reply has been sent to the user.")
-    except Exception as e:
-        await message.reply(f"❌ Failed to send reply: {e}")
-
-    # Clean up
-    del reply_waiting[admin_id]
-
-@app.on_message()
-async def debug_all(client, message):
-    print(f"[DEBUG] Message from {message.from_user.id}: {message.text}")
-
-
-
-
+# Replace the end of your bot.py file with this:
 
 if __name__ == "__main__":
     print("Bot is running...")
