@@ -56,6 +56,15 @@ REPORTS = {}
 reply_waiting = {}
 poster_upload_state = {}
 upload_state = {}
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
+        [InlineKeyboardButton("📂 Japanese Drama", callback_data="category_japanese")],
+        [InlineKeyboardButton("📂 C Drama", callback_data="category_c_drama")],
+        [InlineKeyboardButton("📂 Arabic", callback_data="category_arabic")],
+        [InlineKeyboardButton("🌍 Regional", callback_data="category_regional")],
+        [InlineKeyboardButton("❗️ Report For Show/Episodes", callback_data="report")]
+    ])
 
 # === USER VERIFICATION TRACKING ===
 def get_user_verification_status(user_id):
@@ -248,19 +257,16 @@ def save_data(data):
 def migrate_category():
     collection.update_many({"category": {"$exists": False}}, {"$set": {"category": "Hindi Dubbed"}})
 
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
-        [InlineKeyboardButton("📂 Japanese Drama", callback_data="category_japanese")],
-        [InlineKeyboardButton("📂 C Drama", callback_data="category_c_drama")],
-        [InlineKeyboardButton("📂 Arabic", callback_data="category_arabic")],
-        [InlineKeyboardButton("🌍 Regional", callback_data="category_regional")],
-        [InlineKeyboardButton("❗ Report For Show/Episodes", callback_data="report")]
-    ])
-
 migrate_category()
 
 # === PRIVATE MESSAGE HANDLERS (These will work normally) ===
+
+# Just the key changes you need to make:
+
+# 1. Move this function definition right after your imports and before the start handler:
+
+
+
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     user_id = message.from_user.id
@@ -270,70 +276,69 @@ async def start(client, message):
 
     # Check if user is verified within last 48 hours
     if get_user_verification_status(user_id):
+        # Handle slug for verified users
+        if slug and "__" in slug:
+            try:
+                category_part, show_part = slug.split("__", 1)
+                category = category_part.replace("_", " ").lower().strip()
+                show_name = show_part.replace("_", " ").strip()
+
+                matched_category = None
+                for existing_category in data:
+                    if existing_category.lower().strip() == category:
+                        matched_category = existing_category
+                        break
+
+                if not matched_category or show_name not in data[matched_category]:
+                    return await message.reply("❌ Show not found or category mismatch.")
+            except:
+                return await message.reply("❌ Invalid link format.")
+
+            buttons = [[InlineKeyboardButton(f"⭐️ {show_name}", callback_data=f"show_{matched_category}_{show_name}")]]
+            for s in sorted(data[matched_category]):
+                if s != show_name:
+                    if matched_category == "Hindi Dubbed":
+                        emoji = "🎞"
+                    elif matched_category == "Regional":
+                        emoji = "🌐"
+                    elif matched_category == "Japanese Drama":
+                        emoji = "🎌"
+                    elif matched_category == "C Drama":
+                        emoji = "📺"
+                    elif matched_category == "Arabic":
+                        emoji = "🌍"
+                    else:
+                        emoji = "📁"
+                    buttons.append([InlineKeyboardButton(f"{emoji} {s}", callback_data=f"show_{matched_category}_{s}")])
+
+            category_titles = {
+                "Hindi Dubbed": "🎞 Hindi Dubbed Shows:",
+                "Regional": "🌐 Regional Shows:",
+                "Japanese Drama": "🎌 Japanese Shows:",
+                "C Drama": "📺 C Drama Shows:",
+                "Arabic": "🌍 Arabic Shows:"
+            }
+            title = category_titles.get(matched_category, "📁 All Shows:")
+            update_user_verification(user_id)
+            return await message.reply(title, reply_markup=InlineKeyboardMarkup(buttons))
+
+        # No slug, show main menu for verified users
         return await message.reply(
-            "Welcome back! Choose a category:",
+            "🎬 Welcome back! Choose a category:",
             reply_markup=main_keyboard()
         )
 
     # User needs verification (first time or 48 hours passed)
-    if not slug and not get_user_verification_status(user_id):
-        keyboard = [
-            [InlineKeyboardButton("Join Channel 1", url="https://t.me/KDRAMAAVIL")],
-            [InlineKeyboardButton("Join Channel 2", url="https://t.me/AKDDRAMA20")],
-            [InlineKeyboardButton("I Joined Both", callback_data="joined")]
-        ]
-        return await message.reply("Please join both channels to use the bot.",
-                                   reply_markup=InlineKeyboardMarkup(keyboard))
+    keyboard = [
+        [InlineKeyboardButton("Join Channel 1", url="https://t.me/KDRAMAAVIL")],
+        [InlineKeyboardButton("Join Channel 2", url="https://t.me/AKDDRAMA20")],
+        [InlineKeyboardButton("I Joined Both", callback_data="joined")]
+    ]
+    return await message.reply("Please join both channels to use the bot.",
+                               reply_markup=InlineKeyboardMarkup(keyboard))
 
-    if slug and "__" in slug:
-        try:
-            category_part, show_part = slug.split("__", 1)
-            category = category_part.replace("_", " ").lower().strip()
-            show_name = show_part.replace("_", " ").strip()
+# 3. Update your joined_channel handler:
 
-            matched_category = None
-            for existing_category in data:
-                if existing_category.lower().strip() == category:
-                    matched_category = existing_category
-                    break
-
-            if not matched_category or show_name not in data[matched_category]:
-                return await message.reply("Show not found or category mismatch.")
-        except:
-            return await message.reply("Invalid link format.")
-
-        buttons = [[InlineKeyboardButton(f"{show_name}", callback_data=f"show_{matched_category}_{show_name}")]]
-        for s in sorted(data[matched_category]):
-            if s != show_name:
-                if matched_category == "Hindi Dubbed":
-                    emoji = "🎞"
-                elif matched_category == "Regional":
-                    emoji = "🌍"
-                elif matched_category == "Japanese Drama":
-                    emoji = "🎌"
-                elif matched_category == "C Drama":
-                    emoji = "📺"
-                elif matched_category == "Arabic":
-                    emoji = "🌟"
-                else:
-                    emoji = "🎬"
-                buttons.append([InlineKeyboardButton(f"{emoji} {s}", callback_data=f"show_{matched_category}_{s}")])
-
-        category_titles = {
-            "Hindi Dubbed": "🎞 Hindi Dubbed Shows:",
-            "Regional": "🌍 Regional Shows:",
-            "Japanese Drama": "🎌 Japanese Shows:",
-            "C Drama": "📺 C Drama Shows:",
-            "Arabic": "🌟 Arabic Shows:"
-        }
-        title = category_titles.get(matched_category, "🎬 All Shows:")
-
-        update_user_verification(user_id)
-        return await message.reply(title, reply_markup=InlineKeyboardMarkup(buttons))
-
-    update_user_verification(user_id)
-    return await message.reply("🎬 Welcome to K-Drama Bot! Choose a category :\n"
-                               " 😉please Join to Main channel we will Grow'😙", reply_markup=main_keyboard())
 
 @app.on_callback_query(filters.regex("^joined$"))
 async def joined_channel(client, callback: CallbackQuery):
@@ -355,9 +360,10 @@ async def joined_channel(client, callback: CallbackQuery):
     update_user_verification(user_id)
 
     await callback.message.edit(
-        "🎬 Welcome! Choose a category:",
+        "🎬 Welcome to K-Drama Bot! Choose a category:\n😉please Join to Main channel we will Grow'😙", 
         reply_markup=main_keyboard()
     )
+
 
 # Add all your other existing handlers here (categories, episodes, admin commands, etc.)
 # They will work normally in private chats
@@ -414,15 +420,6 @@ async def category_handler(client, callback_query):
     else:
         await callback_query.answer("No shows found in this category.", show_alert=True)
 
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
-        [InlineKeyboardButton("📂 Japanese Drama", callback_data="category_japanese")],
-        [InlineKeyboardButton("📂 C Drama", callback_data="category_c_drama")],
-        [InlineKeyboardButton("📂 Arabic", callback_data="category_arabic")],
-        [InlineKeyboardButton("🌍 Regional", callback_data="category_regional")],
-        [InlineKeyboardButton("❗️ Report For Show/Episodes", callback_data="report")]
-    ])
 
 # === ALL ADMIN COMMANDS REMAIN UNCHANGED ===
 @app.on_message(filters.command(["add", "add_hindi", "add_regional", "add_jap", "add_c", "add_arb"]) & filters.user(ADMIN_ID) & filters.private)
