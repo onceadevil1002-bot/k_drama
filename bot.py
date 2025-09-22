@@ -21,7 +21,20 @@ import asyncio
 from urllib.parse import unquote, quote
 import logging
 from functools import wraps
+# --- Add this near the imports ---
+from flask import Flask
+import threading
 
+# Create Flask app for dummy web server
+web_app = Flask(__name__)
+
+@web_app.route("/")
+def index():
+    return "✅ K-Drama Bot is running", 200
+
+def run_flask():
+    # Bind to 0.0.0.0 so Render/Heroku can access it
+    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 # --- lightweight logger (non-blocking) ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -302,6 +315,21 @@ def save_data(data):
 
 def migrate_category():
     collection.update_many({"category": {"$exists": False}}, {"$set": {"category": "Hindi Dubbed"}})
+
+def find_show_category(show_name_raw, data):
+    """
+    Search for a show across all categories in the data.
+    Returns (category, show_key) if found, or (None, None) if not found.
+    """
+    show_name_clean = show_name_raw.lower().replace("_", " ").strip()
+
+    for category, shows in data.items():
+        for show_key in shows.keys():
+            show_key_clean = show_key.lower().replace("_", " ").strip()
+            if show_key_clean == show_name_clean:
+                return category, show_key
+
+    return None, None
 
 migrate_category()
 
@@ -1686,7 +1714,14 @@ async def handle_admin_messages(client, message: Message):
             return
 
 # Replace the end of your bot.py file with this:
+# --- Add this before if __name__ == "__main__": ---
+def keep_alive():
+    t = threading.Thread(target=run_flask)
+    t.daemon = True
+    t.start()
+
 
 if __name__ == "__main__":
+    keep_alive()   # start dummy server
     logger.info("Bot is running...")
     app.run()
