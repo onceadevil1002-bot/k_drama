@@ -1,4 +1,3 @@
-from gc import callbacks
 from datetime import datetime, timedelta
 import os
 import json
@@ -433,7 +432,7 @@ async def joined_channel(client, callback: CallbackQuery):
     # Verified - update verification timestamp
     update_user_verification(user_id)
 
-    await callback.message.edit(
+    await callback.message.edit_text(
         "🎬 Welcome to K-Drama Bot! Choose a category:\n😉please Join to Main channel we will Grow'😙", 
         reply_markup=main_keyboard()
     )
@@ -451,7 +450,7 @@ async def category_hindi(client, callback):
         [InlineKeyboardButton(f"🎞 {show}", callback_data=f"show_Hindi Dubbed_{show}")]
         for show in sorted(data["Hindi Dubbed"])
     ]
-    await callback.message.edit("🎞 Hindi Dubbed Shows:", reply_markup=InlineKeyboardMarkup(buttons))
+    await callback.message.edit_text("🎞 Hindi Dubbed Shows:", reply_markup=InlineKeyboardMarkup(buttons))
 
 @app.on_callback_query(filters.regex("^category_regional$"))
 async def category_regional(client, callback):
@@ -462,7 +461,7 @@ async def category_regional(client, callback):
         [InlineKeyboardButton(f"🌍 {show}", callback_data=f"show_Regional_{show}")]
         for show in sorted(data["Regional"])
     ]
-    await callback.message.edit("🌍 Regional Shows:", reply_markup=InlineKeyboardMarkup(buttons))
+    await callback.message.edit_text("🌍 Regional Shows:", reply_markup=InlineKeyboardMarkup(buttons))
 
 @app.on_callback_query(filters.regex("^category_"))
 async def category_handler(client, callback_query):
@@ -969,7 +968,7 @@ async def season_menu(client, callback_query):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     else:
-        await callback_query.message.edit(
+        await callback_query.message.edit_text(
             caption,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -1029,7 +1028,7 @@ async def show_menu(client, callback_query):
             reply_markup=InlineKeyboardMarkup(buttons)
         )
     else:
-        await callback_query.message.edit(
+        await callback_query.message.edit_text(
             caption,
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -1231,11 +1230,11 @@ async def split_parts_view(client, callback_query):
 
         buttons = []
         if parts[0]:
-            buttons.append([InlineKeyboardButton("🅰️ Part 1", callback_data=f"episode_{category}_{show_name}_{key}_{index + 1}_0")])
+            buttons.append([InlineKeyboardButton("🅰️ Part 1", callback_data=f"splitpart_{category}_{show_name}_{key}_{index}_0")])
         if parts[1]:
-            buttons.append([InlineKeyboardButton("🅱️ Part 2", callback_data=f"episode_{category}_{show_name}_{key}_{index + 1}_1")])
+            buttons.append([InlineKeyboardButton("🅱️ Part 2", callback_data=f"splitpart_{category}_{show_name}_{key}_{index}_1")])
 
-        await callback_query.message.edit(
+        await callback_query.message.edit_text(
             f"🎬 {show_name} - Episode {index + 1} Split Parts",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
@@ -1347,8 +1346,10 @@ Split Episodes (max 2 parts):
   /split_jap ShowName Season/Episode
   /split_c ShowName Season/Episode
   /split_arb ShowName Season/Episode
+  Example:- /split_hindi Ghost train 1/2
 Upload Split Part:
   /upload_part ShowName Season EpNo 2   → then send second video
+  Example:- /upload_part Ghost train 1 2 2
 
 
 Delete Commands:
@@ -1631,7 +1632,7 @@ async def test_forward(client, message):
 
 @app.on_callback_query(filters.regex("^report$"))
 async def handle_report(client, callback_query: CallbackQuery):
-    await callback_query.message.edit("Please type the name of the missing show/episode.")
+    await callback_query.message.edit_text("Please type the name of the missing show/episode.")
 
 @app.on_message(filters.text & ~filters.command(["start", "help", "add", "upload", "delete"]) & ~filters.user(ADMIN_ID) & filters.private)
 async def handle_user_report(client, message: Message):
