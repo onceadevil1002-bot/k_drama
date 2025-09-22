@@ -9,7 +9,7 @@ from pymongo import MongoClient
 from dotenv import load_dotenv
 from pyrogram.client import Client
 from pyrogram import filters
-from pyrogram.enums import ChatMemberStatus, ChatType  # Add ChatType import
+from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode  # Add ParseMode import
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import (
     InlineKeyboardMarkup,
@@ -19,6 +19,13 @@ from pyrogram.types import (
 )
 import asyncio
 from urllib.parse import unquote, quote
+import logging
+from functools import wraps
+
+# --- lightweight logger (non-blocking) ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
 
 def is_valid_url(text):
     url_pattern = r'^https?://[\S]+'
@@ -37,7 +44,14 @@ MAIN_CHANNEL_LINK = os.environ["MAIN_CHANNEL_LINK"]
 
 dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
 dns.resolver.default_resolver.nameservers = ['8.8.8.8']
-app = Client("kdrama_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(
+    "kdrama_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    parse_mode=ParseMode.MARKDOWN,
+    sleep_threshold=5
+)
 
 # === REQUIRED CHANNELS FOR VERIFICATION ===
 REQUIRED_CHANNELS = ["-1002648019848"]
@@ -47,15 +61,31 @@ MONGO_URI = os.getenv("MONGO_URI")
 if not MONGO_URI:
     raise ValueError("MONGO_URI not set in environment variables.")
 
-client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=40000, connectTimeoutMS=40000)
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=40000, connectTimeoutMS=4000)
 db = client['kdrama']
 collection = db['shows']
 user_verification_collection = db['user_verification']
+
+# --- ensure indexes for faster lookups (safe if already present) ---
+try:
+    collection.create_index([("category", 1), ("show_name", 1)], unique=True)
+    user_verification_collection.create_index("user_id", unique=True)
+except Exception as e:
+    logger.warning("Index creation warning: %s", e)
+
 
 REPORTS = {}
 reply_waiting = {}
 poster_upload_state = {}
 upload_state = {}
+async def auto_delete_message(msg, delay: int = 180):
+    """Run in background to delete a sent message after `delay` seconds."""
+    try:
+        await asyncio.sleep(delay)
+        await msg.delete()
+    except Exception as e:
+        logger.debug("auto_delete failed: %s", e)
+
 def main_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📂 Hindi Dubbed", callback_data="category_hindi")],
@@ -222,6 +252,20 @@ def load_data():
             data[category][show_name] = {"episodes": episodes, "poster": poster}
 
     return data
+# --- simple TTL cache for load_data to reduce Mongo reads from button spam ---
+_cache = {"data": None, "ts": 0, "ttl": 10}  # ttl seconds
+
+def load_data_cached():
+    now = time.time()
+    if _cache["data"] is None or (now - _cache["ts"]) > _cache["ttl"]:
+        _cache["data"] = load_data()
+        _cache["ts"] = now
+    return _cache["data"]
+
+def clear_data_cache():
+    _cache["data"] = None
+    _cache["ts"] = 0
+
 
 def backup_database():
     now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -253,6 +297,8 @@ def save_data(data):
                 }},
                 upsert=True
             )
+            clear_data_cache()
+
 
 def migrate_category():
     collection.update_many({"category": {"$exists": False}}, {"$set": {"category": "Hindi Dubbed"}})
@@ -270,7 +316,7 @@ migrate_category()
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
     user_id = message.from_user.id
-    data = load_data()
+    data = load_data_cached()
     args = message.text.split()
     slug = args[1] if len(args) > 1 else None
 
@@ -370,7 +416,7 @@ async def joined_channel(client, callback: CallbackQuery):
 
 @app.on_callback_query(filters.regex("^category_hindi$"))
 async def category_hindi(client, callback):
-    data = load_data()
+    data = load_data_cached()
     if "Hindi Dubbed" not in data:
         return await callback.answer("No shows found.")
     buttons = [
@@ -381,7 +427,7 @@ async def category_hindi(client, callback):
 
 @app.on_callback_query(filters.regex("^category_regional$"))
 async def category_regional(client, callback):
-    data = load_data()
+    data = load_data_cached()
     if "Regional" not in data:
         return await callback.answer("No shows found.")
     buttons = [
@@ -403,7 +449,7 @@ async def category_handler(client, callback_query):
     if not matched_category:
         return await callback_query.answer("Unknown category.", show_alert=True)
 
-    data = load_data()
+    data = load_data_cached()
 
     if matched_category in data:
         buttons = []
@@ -475,7 +521,7 @@ async def add_show(client, message):
         else:
             show_name = args.strip()
 
-    data = load_data()
+    data = load_data_cached()
 
     if category not in data:
         data[category] = {}
@@ -537,7 +583,7 @@ for cmd, category in POSTER_CATEGORY_COMMANDS.items():
         except IndexError:
             return await message.reply("Usage: /{} Show Name".format(cmd))
 
-        data = load_data()
+        data = load_data_cached()
         if category not in data or show_name not in data[category]:
             return await message.reply(f"Show *{show_name}* not found under *{category}*.")
 
@@ -588,6 +634,8 @@ async def finalize_poster_upload(client, message):
         {"show_name": state["show_name"], "category": state["category"]},
         {"$set": {"poster": state["file_ids"]}}
     )
+    clear_data_cache()
+
 
     if result.matched_count > 0:
         await message.reply(f"Poster uploaded for *{state['show_name']}*.")
@@ -608,7 +656,7 @@ async def upload_handler(client, message: Message):
                                    "/upload Show Name > Category 2")
 
     args = message.text.split(" ", 1)[1].strip()
-    data = load_data()
+    data = load_data_cached()
 
     category = "Hindi Dubbed"
     show_name = None
@@ -662,7 +710,7 @@ async def upload_handler(client, message: Message):
         }
 
         if is_valid_url(message.text.strip()):
-            data = load_data()
+            data = load_data_cached()
             episodes = data[category][show_name][season_number] if season_number else data[category][show_name]["episodes"]
 
             episodes.append({
@@ -703,33 +751,81 @@ async def handle_video(client, message: Message):
         file_id = fwd.video.file_id
         await fwd.delete()
 
-        data = load_data()
+        data = load_data_cached()
 
-        if "split_index" in state:
-            split_index = state["split_index"]
+                # --- Split Upload Mode ---
+        if state.get("mode") == "upload_split_part":
+            category = state["category"]
+            show = state["show"]
+            season = state["season"]
+            idx = state["index"]
             part = state["part"]
 
-            episodes = data[category][show_name][season_number]
-            if not isinstance(episodes[split_index], list):
-                return await message.reply("Target episode is not split. Use /split_episode first.")
+            episodes = data[category][show][season]
+            if not isinstance(episodes[idx], list):
+                upload_state.pop(user_id, None)
+                return await message.reply("❌ This episode is no longer a split.")
 
-            while len(episodes[split_index]) <= part:
-                episodes[split_index].append(None)
+            while len(episodes[idx]) < 2:
+                episodes[idx].append(None)
 
-            episodes[split_index][part] = file_id
+            episodes[idx][part] = file_id
             backup_database()
             save_data(data)
-            return await message.reply(f"Uploaded part {part + 1} of split episode {split_index + 1} in *{show_name}* Season {season_number}")
+            upload_state.pop(user_id, None)
+            return await message.reply(f"✅ Uploaded Part {part+1} for {show} S{season} Ep{idx+1}.")
 
-        episode_data = {
-            "type": "video",
-            "content": file_id
-        }
 
+    # Special mode: upload into a split episode part
+        if state and state.get("mode") == "upload_split_part":
+            try:
+                fwd = await message.forward(STORAGE_CHANNEL_ID, disable_notification=True)
+                if not fwd.video:
+                    return await message.reply("❌ Only videos allowed in split episodes.")
+                file_id = fwd.video.file_id
+                try:
+                    await fwd.delete()
+                except:
+                    pass
+
+                category = state["category"]
+                show = state["show"]
+                season = state["season"]
+                idx = state["index"]
+                part = state["part"]
+
+                data = load_data_cached()
+                episodes = data[category][show][season]
+                if not isinstance(episodes[idx], list):
+                    return await message.reply("❌ Target is no longer split.")
+
+                while len(episodes[idx]) <= part:
+                    episodes[idx].append(None)
+
+                episodes[idx][part] = file_id
+                backup_database()
+                save_data(data)
+                upload_state.pop(user_id, None)
+
+                await message.reply(f"✅ Uploaded video into {show} S{season} Ep{idx+1} Part {part+1}.")
+                return
+            except Exception as e:
+                logger.exception("handle_video upload_split_part error: %s", e)
+                return await message.reply("Error uploading split part.")
+
+        
         if season_number:
-            data[category][show_name].setdefault(season_number, []).append(episode_data)
+            data[category][show_name].setdefault(season_number, []).append({
+                "type": "video",
+                "content": file_id
+            })
         else:
-            data[category][show_name].setdefault("episodes", []).append(episode_data)
+            data[category][show_name].setdefault("episodes", []).append({
+                "type": "video",
+                "content": file_id
+            })
+
+
         backup_database()
         save_data(data)
 
@@ -741,57 +837,84 @@ async def handle_video(client, message: Message):
     except Exception as e:
         print("Upload error:", e)
         await message.reply("Failed to upload. Please check bot permissions or channel ID.")
-
-# === Continue with all other existing handlers but add filters.private ===
-@app.on_callback_query(filters.regex("^multi_"))
-async def multi_part_episode_menu(client, callback: CallbackQuery):
+@app.on_message(filters.command(["upload_part"]) & filters.user(ADMIN_ID) & filters.private)
+async def upload_part_command(client, message: Message):
+    """
+    Upload into a split episode (works across all categories).
+    Usage: /upload_part Show Name Season Episode Part
+    Example: /upload_part Ghost Train 1 2 2
+    """
     try:
-        _, category, show_name, season_or_key, index = callback.data.split("_", 4)
-        index = int(index) - 1
-        data = load_data()
+        tokens = message.text.split()[1:]
+        if len(tokens) < 4:
+            return await message.reply("Usage: /upload_part ShowName Season Episode Part")
 
-        multi_parts = data[category][show_name][season_or_key][index]
-        if not isinstance(multi_parts, list) or len(multi_parts) != 2:
-            return await callback.answer("Multi-part not found.")
+        season_number = tokens[-3]
+        episode_num = int(tokens[-2])
+        part_no = int(tokens[-1])
+        show_name_raw = " ".join(tokens[:-3]).strip()
 
-        buttons = [
-            [InlineKeyboardButton("▶️ Episode", callback_data=f"mp_ep_{category}_{show_name}_{season_or_key}_{index}_0")],
-            [InlineKeyboardButton("▶️ Episode .5", callback_data=f"mp_ep_{category}_{show_name}_{season_or_key}_{index}_1")]
-        ]
+        ep_index = episode_num - 1
+        part_index = part_no - 1
+        if part_index not in (0, 1):
+            return await message.reply("❌ Only parts 1 or 2 are allowed.")
 
-        await callback.message.edit(
-            f"🎬 Parts for Episode {index + 1}",
-            reply_markup=InlineKeyboardMarkup(buttons)
+        data = load_data_cached()
+
+        # find show across all categories
+        found_category, found_show = None, None
+        for category, shows in data.items():
+            for show_key in shows.keys():
+                if show_key.lower().replace("_", " ") == show_name_raw.lower().replace("_", " "):
+                    found_category, found_show = category, show_key
+                    break
+            if found_category:
+                break
+
+        if not found_category:
+            return await message.reply("❌ Show not found in any category.")
+
+        season_list = data[found_category][found_show].setdefault(season_number, [])
+        if ep_index < 0 or ep_index >= len(season_list):
+            return await message.reply("❌ Episode not found. Upload episode first.")
+
+        entry = season_list[ep_index]
+        if not isinstance(entry, list):
+            return await message.reply("❌ Target episode is not split. Use /split first.")
+
+        # make sure exactly 2 slots
+        while len(entry) < 2:
+            entry.append(None)
+
+        if entry[part_index] is not None:
+            return await message.reply("⚠️ That part already has a video.")
+
+        # save state so next video goes into the right slot
+        upload_state[message.from_user.id] = {
+            "mode": "upload_split_part",
+            "category": found_category,
+            "show": found_show,
+            "season": season_number,
+            "index": ep_index,
+            "part": part_index,
+        }
+        return await message.reply(
+            f"📥 Ready to upload Part {part_no} for {found_show} (S{season_number} Ep{episode_num}). Send video now."
         )
 
     except Exception as e:
-        print("Multi-part submenu error:", e)
-        await callback.answer("Error showing split parts.")
+        logger.exception("upload_part_command error: %s", e)
+        await message.reply("Error preparing split upload.")
 
-@app.on_callback_query(filters.regex("^mp_ep_"))
-async def send_multi_part_episode(client, callback: CallbackQuery):
-    try:
-        _, category, show_name, season_or_key, index_str, part_str = callback.data.split("_", 5)
-        index = int(index_str)
-        part = int(part_str)
-        data = load_data()
 
-        file_id = data[category][show_name][season_or_key][index][part]
-        caption = f"🎬 {show_name} - Episode {index + 1}{'.5' if part == 1 else ''}"
-        sent = await client.send_video(chat_id=callback.from_user.id, video=file_id, caption=caption)
 
-        await callback.answer("Sent! Auto-delete in 3 mins.")
-        await asyncio.sleep(180)
-        await sent.delete()
+# === Continue with all other existing handlers but add filters.private ===
 
-    except Exception as e:
-        print("Multi-part send error:", e)
-        await callback.answer("Couldn't send episode.")
 
 @app.on_callback_query(filters.regex("^season_(.+?)_(.+?)_(.+)$"))
 async def season_menu(client, callback_query):
     category, show_name, season_number = callback_query.data.split("_", 3)[1:]
-    data = load_data()
+    data = load_data_cached()
 
     if show_name not in data.get(category, {}) or season_number not in data[category][show_name]:
         await callback_query.answer("Season not found.")
@@ -828,7 +951,7 @@ async def season_menu(client, callback_query):
 @app.on_callback_query(filters.regex("^show_(.+?)_(.+)$"))
 async def show_menu(client, callback_query):
     category, show_name = callback_query.data.split("_", 2)[1:]
-    data = load_data()
+    data = load_data_cached()
 
     if show_name not in data.get(category, {}):
         await callback_query.answer("Show not found.")
@@ -911,67 +1034,83 @@ async def handle_poster_photo(client, message: Message):
         print("Poster upload error:", e)
         await message.reply("Failed to process poster.")
 
-@app.on_message(filters.command(["split_hindi", "split_jap", "split_c", "split_arb"]) & filters.user(ADMIN_ID) & filters.private)
+@app.on_message(filters.command(["split_hindi", "split_regional", "split_jap", "split_c", "split_arb"]) & filters.user(ADMIN_ID) & filters.private)
 async def split_episode_command(client, message: Message):
+    """
+    Convert an existing single video episode into a split (max 2 parts).
+    Usage examples:
+      /split_hindi My Show 1/5      → Season 1 Episode 5
+      /split_regional My Show 2/7   → Season 2 Episode 7
+    """
     try:
         cmd = message.command[0]
         if len(message.command) < 2 or "/" not in message.text:
-            return await message.reply(
-                "Usage:\n"
-                "/split_hindi Show Name Season No/Episode No\n"
-                "/split_jap Show Name Season No/Episode No\n"
-                "/split_c Show Name Season No/Episode No\n"
-                "/split_arb Show Name Season No/Episode No"
-            )
+            return await message.reply("Usage:\n/split_hindi ShowName Season/Episode")
 
         args = message.text.split(" ", 1)[1].strip()
-        left, episode_part = args.rsplit("/", 1)
-        episode_num = int(episode_part.strip())
-        episode_index = episode_num - 1
+        left, episode_str = args.rsplit("/", 1)
+        episode_num = int(episode_str.strip())
+        ep_index = episode_num - 1
 
+        # detect season vs no season
         tokens = left.strip().split()
-        show_name = " ".join(tokens[:-1]) if tokens[-1].isdigit() else " ".join(tokens)
-        season_number = tokens[-1] if tokens[-1].isdigit() else None
+        if tokens and tokens[-1].isdigit():
+            season_number = tokens[-1]
+            show_name = " ".join(tokens[:-1]).strip()
+        else:
+            season_number = "1"
+            show_name = " ".join(tokens).strip()
 
+        # map category
         cmd_category_map = {
             "split_hindi": "Hindi Dubbed",
+            "split_regional": "Regional",
             "split_jap": "Japanese Drama",
             "split_c": "C Drama",
             "split_arb": "Arabic"
         }
-        category = cmd_category_map.get(cmd)
-        
-        data = load_data()
+        category = cmd_category_map.get(cmd, "Hindi Dubbed")
 
+        data = load_data_cached()
         if category not in data or show_name not in data[category]:
-            return await message.reply("Show not found in the selected category.")
+            return await message.reply("❌ Show not found in database.")
 
-        episodes = (
-            data[category][show_name].get(season_number)
-            if season_number else data[category][show_name].get("episodes")
-        )
+        season_list = data[category][show_name].setdefault(season_number, [])
+        if ep_index < 0 or ep_index >= len(season_list):
+            return await message.reply("❌ Episode not found. Upload it first before splitting.")
+
+        entry = season_list[ep_index]
+
+        # --- handle different formats ---
+        if isinstance(entry, dict) and entry.get("type") == "link":
+            return await message.reply("❌ Links cannot be split. Use /upload link normally.")
+
+        if isinstance(entry, dict) and entry.get("type") == "video":
+            season_list[ep_index] = [entry["content"], None]
+            backup_database()
+            save_data(data)
+            return await message.reply(f"✅ Converted Ep{episode_num} into split (slot for Part 2 ready). Use /upload_part.")
         
-        if not episodes:
-            return await message.reply("No episodes found for the selected show.")
-        
-        if episode_index < 0 or episode_index >= len(episodes):
-            return await message.reply("Episode index out of range.")
+        elif isinstance(entry, str):  # old raw file_id style
+            season_list[ep_index] = [entry, None]
+            backup_database()
+            save_data(data)
+            return await message.reply(f"✅ Converted Ep{episode_num} into split (slot for Part 2 ready). Use /upload_part.")
 
-        original = episodes[episode_index]
+        elif isinstance(entry, list):
+            if len(entry) >= 2:
+                return await message.reply("⚠️ Only 2 parts allowed per episode.")
+            if entry[1] is not None:
+                return await message.reply("⚠️ Part 2 already uploaded.")
+            return await message.reply(f"Slot already prepared for Part 2 in Ep{episode_num}. Use /upload_part.")
 
-        if isinstance(original, list):
-            return await message.reply("Episode is already split.")
-
-        episodes[episode_index] = [original, None]
-        backup_database()
-        save_data(data)
-
-        label = f"{episode_num} (S{season_number})" if season_number else f"{episode_num}"
-        return await message.reply(f"Episode {label} is now split into two parts (waiting for part 2).")
-
+        else:
+            return await message.reply("❌ Unsupported episode format. Try re-uploading the episode.")
     except Exception as e:
-        print("[split_episode_command] error:", e)
-        return await message.reply("Failed to process split episode.")
+        logger.exception("split_episode_command error: %s", e)
+        await message.reply("Error while splitting episode.")
+
+
     
 @app.on_message(filters.command(["upload_split_hindi", "upload_split_regional", "upload_split_jap", "upload_split_c", "upload_split_arb"]) & filters.user(ADMIN_ID) & filters.private)
 async def upload_split_handler(client, message: Message):
@@ -984,7 +1123,9 @@ async def upload_split_handler(client, message: Message):
             "upload_split_c": "C Drama",
             "upload_split_arb": "Arabic"
         }
-        category = cmd_category_map[cmd]
+        category = cmd_category_map.get(cmd)
+        if not category:
+            return await message.reply("Unknown split upload command.")
 
         if len(message.command) < 2:
             return await message.reply("Usage:\n/upload_split_hindi Show Season Episode Part")
@@ -993,7 +1134,7 @@ async def upload_split_handler(client, message: Message):
         if len(args) < 4:
             return await message.reply("Format error. Provide Show, Season, Episode, Part")
 
-        show_name = " ".join(args[:-3])
+        show_name_raw = " ".join(args[:-3]).strip()
         season = args[-3]
         episode = int(args[-2])
         part_index = int(args[-1]) - 1
@@ -1001,33 +1142,46 @@ async def upload_split_handler(client, message: Message):
         if part_index not in (0, 1):
             return await message.reply("Part must be 1 or 2")
 
-        data = load_data()
+        data = load_data_cached()
 
-        if category not in data or show_name not in data[category]:
-            return await message.reply("Show not found.")
-        if season not in data[category][show_name]:
+        # Try to match in the given category first, otherwise search across categories
+        if category not in data or show_name_raw not in data[category]:
+            found_cat, found_key = find_show_category(show_name_raw, data)
+            if found_cat:
+                category = found_cat
+                show_key = found_key
+            else:
+                return await message.reply("Show not found.")
+        else:
+            show_key = show_name_raw
+
+        if season not in data[category][show_key]:
             return await message.reply("Season not found.")
 
-        episodes = data[category][show_name][season]
+        episodes = data[category][show_key][season]
         if episode < 1 or episode > len(episodes):
             return await message.reply("Episode index out of range.")
         if not isinstance(episodes[episode - 1], list):
-            return await message.reply("Episode not marked as split. Use /split_hindi first.")
+            return await message.reply("Episode not marked as split. Use /split_* first.")
 
+        # set state in unified shape
         upload_state[message.from_user.id] = {
-            "show": show_name,
-            "season": season,
+            "mode": "upload_split_part",
             "category": category,
-            "split_index": episode - 1,
+            "show": show_key,
+            "season": season,
+            "index": episode - 1,
             "part": part_index
         }
 
         return await message.reply(
-            f"Send video for *{show_name}* S{season} Ep {episode} Part {part_index + 1}"
+            f"📥 Send video for *{show_key}* S{season} Ep {episode} Part {part_index + 1}"
         )
+
     except Exception as e:
-        print("[upload_split_handler] error:", e)
+        logger.exception("[upload_split_handler] error: %s", e)
         return await message.reply("Failed to process upload split.")
+
 
 @app.on_callback_query(filters.regex("^noop$"))
 async def do_nothing(client, callback_query: CallbackQuery):
@@ -1038,7 +1192,7 @@ async def split_parts_view(client, callback_query):
     try:
         _, category, show_name, key, index = callback_query.data.split("_", 4)
         index = int(index) - 1
-        data = load_data()
+        data = load_data_cached()
 
         if show_name not in data[category] or key not in data[category][show_name]:
             return await callback_query.answer("Not found.")
@@ -1063,7 +1217,7 @@ async def split_parts_view(client, callback_query):
 
 @app.on_message(filters.command("list") & filters.user(ADMIN_ID) & filters.private)
 async def list_content(client, message):
-    data = load_data()
+    data = load_data_cached()
     output = "Available Shows:\n"
     for category in data:
         output += f"- {category}\n"
@@ -1078,7 +1232,7 @@ async def list_content(client, message):
 
 @app.on_message(filters.command("get_links") & filters.user(ADMIN_ID) & filters.private)
 async def get_links(client, message):
-    data = load_data()
+    data = load_data_cached()
     if not data:
         return await message.reply("No shows found.")
 
@@ -1160,16 +1314,14 @@ Arabic:
   /upload_arb Show Name
   /upload Show Name > Arabic
 
-SPLIT & UPLOAD SPLIT PARTS
-Split Episodes:
-  /split_episode Show Name /EpNo > Category
+Split Episodes (max 2 parts):
+  /split_hindi ShowName Season/Episode
+  /split_jap ShowName Season/Episode
+  /split_c ShowName Season/Episode
+  /split_arb ShowName Season/Episode
+Upload Split Part:
+  /upload_part ShowName Season EpNo 2   → then send second video
 
-Upload Split Episodes:
-  /upload_split_hindi Show Season Ep Part
-  /upload_split_regional Show Season Ep Part
-  /upload_split_jap Show Season Ep Part
-  /upload_split_c Show Season Ep Part
-  /upload_split_arb Show Season Ep Part
 
 Delete Commands:
 Hindi Dubbed
@@ -1260,7 +1412,7 @@ async def delete_content(client, message: Message):
         }
         raw_category = cmd_category_map.get(cmd, "Hindi Dubbed")
         category = CATEGORY_ALIASES.get(raw_category, raw_category)
-        data = load_data()
+        data = load_data_cached()
 
         if show_name not in data.get(category, {}):
             return await message.reply(f"Show not found in *{category}*")
@@ -1323,7 +1475,7 @@ async def send_episode(client, callback_query: CallbackQuery):
         show_name_parts = parts[1:-2]
         show_name = "_".join(show_name_parts)
         index = int(index_str) - 1
-        data = load_data()
+        data = load_data_cached()
 
         if show_name not in data.get(category, {}):
             return await callback_query.answer("Show not found.")
@@ -1367,9 +1519,9 @@ async def send_episode(client, callback_query: CallbackQuery):
                 video=episode_data["content"],
                 caption=f"🎬 {show_name.replace('_', ' ')} - Episode {index + 1}"
             )
+            asyncio.create_task(auto_delete_message(sent_msg, 180))
             await callback_query.answer("Sent video. It will auto-delete in 3 minutes.")
-            await asyncio.sleep(180)
-            await sent_msg.delete()
+
 
         elif episode_data["type"] == "link":
             await client.send_message(
@@ -1396,28 +1548,45 @@ async def send_split_part(client, callback_query: CallbackQuery):
         payload = callback_query.data[len("splitpart_"):]
         parts = payload.split("_")
         if len(parts) < 5:
-            return await callback_query.answer("Invalid split part data.")
+            return await callback_query.answer("Invalid split data.")
 
         category, *name_parts, season_or_key, ep_index_str, part_index_str = parts
         show_name = "_".join(name_parts)
         ep_index = int(ep_index_str)
-        part_index = int(part_index_str)
-        data = load_data()
+        part_index = int(part_index_str)  # must be 0 or 1
 
-        file_id = data[category][show_name][season_or_key][ep_index][part_index]
+        if part_index not in (0, 1):
+            return await callback_query.answer("Invalid part index.")
+
+        data = load_data_cached()
+        if season_or_key not in data.get(category, {}).get(show_name, {}):
+            return await callback_query.answer("Season not found.")
+
+        episodes = data[category][show_name][season_or_key]
+        if ep_index < 0 or ep_index >= len(episodes):
+            return await callback_query.answer("Episode not found.")
+
+        entry = episodes[ep_index]
+        if not isinstance(entry, list) or len(entry) < 2:
+            return await callback_query.answer("This is not a split episode.")
+
+        file_id = entry[part_index]
+        if not file_id:
+            return await callback_query.answer("That part is not uploaded yet.")
 
         sent_msg = await client.send_video(
             chat_id=callback_query.from_user.id,
             video=file_id,
-            caption=f"🎬 {show_name.replace('_', ' ')} - Part {part_index + 1}"
+            caption=f"🎬 {show_name.replace('_',' ')} | S{season_or_key}E{ep_index+1} - Part {part_index+1}"
         )
+        asyncio.create_task(auto_delete_message(sent_msg, 180))
         await callback_query.answer("Sent part. Auto-deletes in 3 minutes.")
-        await asyncio.sleep(180)
-        await sent_msg.delete()
 
     except Exception as e:
-        print(f"[send_split_part] ERROR: {e}")
+        logger.exception("send_split_part error: %s", e)
         await callback_query.answer("Could not send split part.")
+
+
 
 @app.on_message(filters.command("test_forward") & filters.user(ADMIN_ID) & filters.private)
 async def test_forward(client, message):
@@ -1499,7 +1668,7 @@ async def handle_admin_messages(client, message: Message):
             season = state["season"]
             category = state["category"]
             
-            data = load_data()
+            data = load_data_cached()
             
             if season:
                 data[category][show].setdefault(season, []).append({
@@ -1519,5 +1688,5 @@ async def handle_admin_messages(client, message: Message):
 # Replace the end of your bot.py file with this:
 
 if __name__ == "__main__":
-    print("Bot is running...")
+    logger.info("Bot is running...")
     app.run()
