@@ -21,6 +21,7 @@ if sys.platform == 'win32' and sys.version_info >= (3, 10):
         pass
 
 from pymongo import MongoClient
+from pymongo.errors import NetworkTimeout, AutoReconnect, ServerSelectionTimeoutError
 from bson import ObjectId
 from dotenv import load_dotenv
 
@@ -30,6 +31,7 @@ load_dotenv()
 from pyrogram.client import Client
 from pyrogram import filters
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
+from pyrogram.errors import MessageNotModified, QueryIdInvalid
 from pyrogram.types import User as PyroUser
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.errors import UserNotParticipant, RPCError
@@ -41,9 +43,7 @@ from pyrogram.types import (
     ChatPermissions,
     ForceReply,
 )
-import threading
 from collections import deque, OrderedDict
-import signal
 from cachetools import TTLCache
 import random
 
@@ -62,49 +62,16 @@ except Exception:
 from urllib.parse import unquote, quote
 import logging
 from functools import wraps
-from flask import Flask, jsonify
-import threading
 from typing import Dict, List, Tuple, Optional, Any
 import hashlib
 import base64
 
-# Create Flask app for dummy web server
-web_app = Flask(__name__)
-
-@web_app.route("/")
-def index():
-    return "✅ K-Drama Bot is running", 200
-
-@web_app.route("/health")
-def health():
-    """Health check endpoint for monitoring."""
-    try:
-        # Check MongoDB connection
-        client.admin.command('ping')
-        mongo_status = "connected"
-    except Exception as e:
-        mongo_status = f"disconnected: {str(e)}"
-    
-    # Check Pyrogram connection
-    bot_status = "connected" if app.is_connected else "disconnected"
-    
-    # Overall health
-    is_healthy = mongo_status == "connected" and bot_status == "connected"
-    status_code = 200 if is_healthy else 503
-    
-    return jsonify({
-        "status": "healthy" if is_healthy else "unhealthy",
-        "bot": bot_status,
-        "database": mongo_status,
-        "timestamp": time.time()
-    }), status_code
-
-def run_flask():
-    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
 # Lightweight logger
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Import keep-alive server
+from keep_alive import start_server
 
 def is_valid_url(text):
     url_pattern = r'^https?://[\S]+'
@@ -143,9 +110,10 @@ client = MongoClient(
     maxPoolSize=50,
     minPoolSize=10,
     maxIdleTimeMS=45000,
-    serverSelectionTimeoutMS=50000,
-    connectTimeoutMS=2000,
-    socketTimeoutMS=10000,  # ADD THIS: 10 second socket timeout
+    # Increase timeouts to allow TLS handshake and slow networks to complete
+    serverSelectionTimeoutMS=30000,  # 30s to select a server
+    connectTimeoutMS=10000,          # 10s TCP connect / TLS handshake
+    socketTimeoutMS=45000,           # 45s socket read/write timeout
     retryWrites=True,
     compressors='zlib'
 )
@@ -196,12 +164,8 @@ report_waiting = {}
 recent_updates = []
 recent_updates_lock = threading.Lock()
 active_notification_tasks = set()  # Track active notification tasks for graceful shutdown
-@app.on_message()
-async def debug_all_messages(client, message):
-    print(f"[DEBUG] Received a message: {message.text}")
-@app.on_message()
-async def test_msg(client, message):
-    print(f"ANY MESSAGE RECEIVED: {message.text}")
+
+
 
 # Category emojis
 CATEGORY_EMOJIS = {
@@ -503,27 +467,42 @@ def load_data():
         "poster": 1,
         "_id": 0
     }
-    
-    try:
-        cursor = collection.find({}, projection, batch_size=100)
-        
-        for doc in cursor:
-            category = doc.get("category", "Hindi Dubbed")
-            show_name = doc["show_name"]
-            episodes = doc.get("episodes", {})
-            poster = doc.get("poster", [])
+    # Retry loop for transient network/SSL errors (ex: Atlas TLS handshake timeouts)
+    retries = 3
+    backoff = 1.0
+    for attempt in range(1, retries + 1):
+        try:
+            cursor = collection.find({}, projection, batch_size=100)
 
-            if category not in data:
-                data[category] = {}
+            for doc in cursor:
+                category = doc.get("category", "Hindi Dubbed")
+                show_name = doc["show_name"]
+                episodes = doc.get("episodes", {})
+                poster = doc.get("poster", [])
 
-            if isinstance(episodes, dict):
-                episodes["poster"] = poster
-                data[category][show_name] = episodes
-            else:
-                data[category][show_name] = {"episodes": episodes, "poster": poster}
-    except Exception as e:
-        logger.exception(f"Error loading data: {e}")
-    
+                if category not in data:
+                    data[category] = {}
+
+                if isinstance(episodes, dict):
+                    episodes["poster"] = poster
+                    data[category][show_name] = episodes
+                else:
+                    data[category][show_name] = {"episodes": episodes, "poster": poster}
+
+            # success
+            return data
+
+        except (NetworkTimeout, AutoReconnect, ServerSelectionTimeoutError) as e:
+            logger.warning(f"Transient DB error while loading data (attempt {attempt}/{retries}): {e}")
+            if attempt == retries:
+                logger.exception("Failed to load data after retries")
+                break
+            time.sleep(backoff)
+            backoff *= 2
+        except Exception as e:
+            logger.exception(f"Unexpected error loading data: {e}")
+            break
+
     return data
 
 
@@ -4881,11 +4860,22 @@ async def send_episode(client, callback_query: CallbackQuery):
                     callback_data=f"season|{enc_cat}|{enc_show}|{enc_season}"
                 )])
 
-                await callback_query.message.edit_text(
-                    f"🎬 **{show_name}** - Episode {episode_idx + 1}\n\n📊 Choose quality:",
-                    reply_markup=InlineKeyboardMarkup(buttons)
-                )
-                await callback_query.answer()
+                try:
+                    await callback_query.message.edit_text(
+                        f"🎬 **{show_name}** - Episode {episode_idx + 1}\n\n📊 Choose quality:",
+                        reply_markup=InlineKeyboardMarkup(buttons)
+                    )
+                except MessageNotModified:
+                    logger.debug("edit_text skipped: message not modified (qualities)")
+                except Exception as e:
+                    logger.exception(f"Unexpected edit_text error (qualities): {e}")
+
+                try:
+                    await callback_query.answer()
+                except QueryIdInvalid:
+                    logger.debug("callback answer skipped: query id invalid (qualities)")
+                except Exception as e:
+                    logger.exception(f"Unexpected callback answer error (qualities): {e}")
                 return
         
         # ✅ Handle split episodes
@@ -4907,11 +4897,22 @@ async def send_episode(client, callback_query: CallbackQuery):
                 callback_data=f"season|{enc_cat}|{enc_show}|{enc_season}"
             )])
             
-            await callback_query.message.edit_text(
-                f"🎬 **{show_name}** - Episode {episode_idx + 1} (Split)",
-                reply_markup=InlineKeyboardMarkup(buttons)
-            )
-            await callback_query.answer()
+            try:
+                await callback_query.message.edit_text(
+                    f"🎬 **{show_name}** - Episode {episode_idx + 1} (Split)",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            except MessageNotModified:
+                logger.debug("edit_text skipped: message not modified (split)")
+            except Exception as e:
+                logger.exception(f"Unexpected edit_text error (split): {e}")
+
+            try:
+                await callback_query.answer()
+            except QueryIdInvalid:
+                logger.debug("callback answer skipped: query id invalid (split)")
+            except Exception as e:
+                logger.exception(f"Unexpected callback answer error (split): {e}")
             return
         
         # ✅ Handle legacy string format
@@ -4930,7 +4931,12 @@ async def send_episode(client, callback_query: CallbackQuery):
                     )
                     asyncio.create_task(increment_show_view(category, show_name))
                     asyncio.create_task(auto_delete_message(sent_msg, 180))
-                    await callback_query.answer("📹 Sent! Auto-deletes in 3 min.")
+                    try:
+                        await callback_query.answer("📹 Sent! Auto-deletes in 3 min.")
+                    except QueryIdInvalid:
+                        logger.debug("callback answer skipped: query id invalid (send video)")
+                    except Exception as e:
+                        logger.exception(f"Unexpected callback answer error (send video): {e}")
                     return
                 except FloodWait as e:
                     logger.warning(f"FloodWait {e.value}s when sending episode")
@@ -4964,7 +4970,12 @@ async def send_episode(client, callback_query: CallbackQuery):
                     )
                     asyncio.create_task(increment_show_view(category, show_name))
                     asyncio.create_task(auto_delete_message(sent_msg, 180))
-                    await callback_query.answer("📄 Sent! Auto-deletes in 3 min.")
+                    try:
+                        await callback_query.answer("📄 Sent! Auto-deletes in 3 min.")
+                    except QueryIdInvalid:
+                        logger.debug("callback answer skipped: query id invalid (send document)")
+                    except Exception as e:
+                        logger.exception(f"Unexpected callback answer error (send document): {e}")
                     return
                 except FloodWait as e:
                     logger.warning(f"FloodWait {e.value}s when sending document")
@@ -4997,7 +5008,12 @@ async def send_episode(client, callback_query: CallbackQuery):
                     ]]),
                     disable_web_page_preview=False
                 )
-                await callback_query.answer("🔗 Link sent!")
+                try:
+                    await callback_query.answer("🔗 Link sent!")
+                except QueryIdInvalid:
+                    logger.debug("callback answer skipped: query id invalid (link)")
+                except Exception as e:
+                    logger.exception(f"Unexpected callback answer error (link): {e}")
                 return
         
         await callback_query.answer("❌ Unsupported format.", show_alert=True)
@@ -7736,138 +7752,27 @@ async def cleanup_session(client, message: Message):
     else:
         await message.reply("No messages to clean up.")
 
-def run_flask_server():
-    """Run Flask server in background thread for Render keep-alive."""
-    import os
-    from flask import Flask
-    
-    # embed simple flask app
-    app = Flask(__name__)
-    
-    @app.route('/')
-    def home():
-        return "Bot is running!"
-    
-    port = int(os.environ.get("PORT", 5000))
-    
-    logger.info(f"🌐 Starting Flask server on port {port}...")
-    
-    # Run Flask server (this blocks in this thread)
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False  # Important: disable reloader in production
-    )
-
 # ============================
-# GRACEFUL SHUTDOWN
+# BOT MAIN ENTRY POINT
 # ============================
 
-def graceful_shutdown(signum, frame):
-    """Handle shutdown signals gracefully."""
-    logger.info("🛑 Received shutdown signal, cleaning up...")
-    
-    try:
-        # Cancel active notification tasks
-        if active_notification_tasks:
-            logger.info(f"Cancelling {len(active_notification_tasks)} notification tasks...")
-            for task in active_notification_tasks:
-                if not task.done():
-                    task.cancel()
-        
-        # Save recent updates
-        save_recent_updates()
-        logger.info("✅ Saved recent updates")
-        
-        # Close MongoDB connection
-        client.close()
-        logger.info("✅ Closed MongoDB connection")
-        
-        # Stop Pyrogram client (non-blocking)
-        logger.info("✅ Stopping Pyrogram client")
-        
-    except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
-    
-    logger.info("👋 Shutdown complete")
-    sys.exit(0)
-
-# Register signal handlers
-signal.signal(signal.SIGINT, graceful_shutdown)
-signal.signal(signal.SIGTERM, graceful_shutdown)
-
-# ============================================================
-# DIAGNOSTIC VERSION - Use this to see what's happening
-# ============================================================
 if __name__ == "__main__":
     logger.info("=" * 50)
     logger.info("🚀 K-DRAMA BOT STARTING")
     logger.info("=" * 50)
     
-    # Start Flask server in background thread
-    from threading import Thread
-    import time
-    
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info("✅ Flask server thread started")
-    
-    # Periodic reconnection using Pyrogram's run() with timeout
-    CONNECTION_LIFETIME = 1500  # 25 minutes
-    
-    def restart_loop():
-        """Restart the bot periodically to maintain fresh connections"""
-        restart_count = 0
-        
-        while True:
-            try:
-                restart_count += 1
-                logger.info(f"🔌 Starting bot (restart #{restart_count})...")
-                
-                # Use Pyrogram's run() which handles everything internally
-                # We'll create a separate thread to stop it after timeout
-                stop_event = threading.Event()
-                
-                def auto_stop():
-                    """Stop the bot after CONNECTION_LIFETIME seconds"""
-                    time.sleep(CONNECTION_LIFETIME)
-                    logger.info("⏰ Connection lifetime exceeded, stopping bot...")
-                    stop_event.set()
-                    try:
-                        app.stop()
-                    except:
-                        pass
-                
-                # Start auto-stop timer in background
-                stop_thread = Thread(target=auto_stop, daemon=True)
-                stop_thread.start()
-                
-                # Run the bot - this blocks until stopped
-                app.run()
-                
-                # If we get here, bot was stopped (either by timer or error)
-                logger.info("✅ Bot stopped, waiting 5 seconds before reconnect...")
-                time.sleep(5)
-                
-            except KeyboardInterrupt:
-                logger.info("⚠️ Bot interrupted by user")
-                break
-            except Exception as e:
-                logger.error(f"❌ Bot error: {e}")
-                logger.exception(e)
-                logger.info("⏳ Retrying in 30 seconds...")
-                time.sleep(30)
-        
-        logger.info("👋 Bot shutdown complete")
-    
-    # Run with periodic restarts
+    # Start keep-alive server for uptime monitoring
     try:
-        restart_loop()
-    except KeyboardInterrupt:
-        logger.info("⚠️ Interrupted by user")
+        start_server(port=int(os.environ.get("PORT", 10000)))
     except Exception as e:
-        logger.exception(f"💥 Fatal error: {e}")
+        logger.warning(f"⚠️ Could not start keep-alive server: {e}")
+    
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        logger.info("⚠️ Bot interrupted by user")
+    except Exception as e:
+        logger.exception(f"Bot error: {e}")
     finally:
         logger.info("=" * 50)
         logger.info("🏁 BOT TERMINATED")
