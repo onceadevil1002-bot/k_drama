@@ -29,7 +29,6 @@ load_dotenv()
 
 from pyrogram.client import Client
 from pyrogram import filters
-from pyrogram.sync import idle
 from pyrogram.errors import FloodWait, UserIsBlocked, InputUserDeactivated
 from pyrogram.types import User as PyroUser
 from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
@@ -144,7 +143,7 @@ client = MongoClient(
     maxPoolSize=50,
     minPoolSize=10,
     maxIdleTimeMS=45000,
-    serverSelectionTimeoutMS=5000,
+    serverSelectionTimeoutMS=50000,
     connectTimeoutMS=2000,
     socketTimeoutMS=10000,  # ADD THIS: 10 second socket timeout
     retryWrites=True,
@@ -197,6 +196,12 @@ report_waiting = {}
 recent_updates = []
 recent_updates_lock = threading.Lock()
 active_notification_tasks = set()  # Track active notification tasks for graceful shutdown
+@app.on_message()
+async def debug_all_messages(client, message):
+    print(f"[DEBUG] Received a message: {message.text}")
+@app.on_message()
+async def test_msg(client, message):
+    print(f"ANY MESSAGE RECEIVED: {message.text}")
 
 # Category emojis
 CATEGORY_EMOJIS = {
@@ -928,6 +933,7 @@ async def notify_new_content(show_name, category, show_slug, is_new_show, episod
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(client, message):
+    print("Start command invoked")
     await upsert_user_from_context(message.from_user, message.chat)
 
     user_id = message.from_user.id
@@ -7791,22 +7797,78 @@ def graceful_shutdown(signum, frame):
 signal.signal(signal.SIGINT, graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
 
+# ============================================================
+# DIAGNOSTIC VERSION - Use this to see what's happening
+# ============================================================
 if __name__ == "__main__":
+    logger.info("=" * 50)
+    logger.info("🚀 K-DRAMA BOT STARTING")
+    logger.info("=" * 50)
+    
     # Start Flask server in background thread
     from threading import Thread
+    import time
     
-    flask_thread = Thread(target=run_flask_server, daemon=True)
+    flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("✅ Flask server thread started")
     
-    # Start Telegram bot with idle loop
-    logger.info("Bot is running...")
+    # Periodic reconnection using Pyrogram's run() with timeout
+    CONNECTION_LIFETIME = 1500  # 25 minutes
+    
+    def restart_loop():
+        """Restart the bot periodically to maintain fresh connections"""
+        restart_count = 0
+        
+        while True:
+            try:
+                restart_count += 1
+                logger.info(f"🔌 Starting bot (restart #{restart_count})...")
+                
+                # Use Pyrogram's run() which handles everything internally
+                # We'll create a separate thread to stop it after timeout
+                stop_event = threading.Event()
+                
+                def auto_stop():
+                    """Stop the bot after CONNECTION_LIFETIME seconds"""
+                    time.sleep(CONNECTION_LIFETIME)
+                    logger.info("⏰ Connection lifetime exceeded, stopping bot...")
+                    stop_event.set()
+                    try:
+                        app.stop()
+                    except:
+                        pass
+                
+                # Start auto-stop timer in background
+                stop_thread = Thread(target=auto_stop, daemon=True)
+                stop_thread.start()
+                
+                # Run the bot - this blocks until stopped
+                app.run()
+                
+                # If we get here, bot was stopped (either by timer or error)
+                logger.info("✅ Bot stopped, waiting 5 seconds before reconnect...")
+                time.sleep(5)
+                
+            except KeyboardInterrupt:
+                logger.info("⚠️ Bot interrupted by user")
+                break
+            except Exception as e:
+                logger.error(f"❌ Bot error: {e}")
+                logger.exception(e)
+                logger.info("⏳ Retrying in 30 seconds...")
+                time.sleep(30)
+        
+        logger.info("👋 Bot shutdown complete")
+    
+    # Run with periodic restarts
     try:
-        app.run()  # Pyrogram's run() method handles everything
-        logger.info("Bot started successfully")
+        restart_loop()
     except KeyboardInterrupt:
-        logger.info("Bot interrupted by user")
+        logger.info("⚠️ Interrupted by user")
     except Exception as e:
-        logger.exception(f"Bot error: {e}")
+        logger.exception(f"💥 Fatal error: {e}")
     finally:
-        logger.info("Bot shutdown complete")
+        logger.info("=" * 50)
+        logger.info("🏁 BOT TERMINATED")
+        logger.info("=" * 50)

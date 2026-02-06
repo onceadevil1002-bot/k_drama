@@ -6,3 +6,4 @@ python-dotenv
 flask
 dnspython
 cachetools>=5.3.0
+gunicorn
