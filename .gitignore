@@ -1,0 +1,54 @@
+# ========================
+# ENV (CRITICAL)
+# ========================
+.env
+bot/.env
+
+# ========================
+# Sessions (CRITICAL)
+# ========================
+*.session
+*.session-journal
+
+# ========================
+# Python cache
+# ========================
+__pycache__/
+*.pyc
+*.pyo
+
+# ========================
+# Downloads / temp media
+# ========================
+bot/downloads/
+
+# ========================
+# Backup data (HEAVY + PRIVATE)
+# ========================
+backup/
+
+# ========================
+# Dev / Local tools (EXCLUDE)
+# ========================
+importer.py
+dumper.py
+dump_progress.json
+import_progress.json
+walkthrough.md
+
+# ========================
+# VS Code / Workspace
+# ========================
+.vscode/
+*.code-workspace
+
+# ========================
+# Internal tools
+# ========================
+.qodo/
+
+# ========================
+# OS junk
+# ========================
+.DS_Store
+Thumbs.db
