@@ -17,15 +17,11 @@ async def add_recent_update(category, show_name, season, episode_num):
     await db.recent_updates.insert_one(update)
     logger.debug(f"Added recent update: {show_name} S{season} E{episode_num}")
     
-    # Keep only most recent 20
-    count = await db.recent_updates.count_documents({})
-    if count > 20:
-        # Find the oldest and delete
-        oldest = await db.recent_updates.find().sort("timestamp", 1).limit(count - 20).to_list(None)
-        ids = [doc["_id"] for doc in oldest]
-        await db.recent_updates.delete_many({"_id": {"$in": ids}})
+    # Flush entries older than 7 days (weekly retention)
+    seven_days_ago = int(time.time()) - (7 * 24 * 3600)
+    await db.recent_updates.delete_many({"timestamp": {"$lt": seven_days_ago}})
 
-async def get_recent_updates(limit=50):
+async def get_recent_updates(limit=1000):
     """Retrieve the most recent updates from the last 7 days."""
     seven_days_ago = int(time.time()) - (7 * 24 * 3600)
     query = {"timestamp": {"$gte": seven_days_ago}}

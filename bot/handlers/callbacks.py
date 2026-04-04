@@ -10,7 +10,7 @@ from bot.utils.logger import track_performance
 from bot.services.shows import get_cached_data, increment_view
 from bot.services.favorites import add_favorite, remove_favorite, is_favorited
 from bot.services.sessions import create_group_session, get_group_session
-from bot.config import ADMIN_IDS
+from bot.config import ADMIN_IDS, get_category_emoji
 from bot.utils.behavior import track_behavior
 
 logger = logging.getLogger(__name__)

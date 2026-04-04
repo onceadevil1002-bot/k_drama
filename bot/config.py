@@ -38,14 +38,15 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 
 # Category Emojis
 CATEGORY_EMOJIS = {
-    "Hindi Dubbed": "🎞",
-    "Regional": "🌍",
+    "K-Hindi": "🎙️",
+    "K-Original": "🎌",
     "Japanese Drama": "🎌",
-    "C Drama": "📺",
-    "Arabic": "🌙",
+    "CT Drama": "🏮",
+    "Global": "🌍",
     "Pakistan": "🇵🇰",
     "Anime": "🎨"
 }
 
 def get_category_emoji(category: str) -> str:
     return CATEGORY_EMOJIS.get(category, "📂")
+

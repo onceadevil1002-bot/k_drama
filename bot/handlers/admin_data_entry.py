@@ -19,46 +19,50 @@ from bot.services.updates import add_recent_update
 
 # --- CONFIG & MAPS ---
 IMPORT_CATEGORY_MAP = {
-    "import_hindi": "Hindi Dubbed",
-    "import_regional": "Regional",
+    "import_hindi": "K-Hindi",
+    "import_orig": "K-Original",
     "import_jap": "Japanese Drama",
-    "import_c": "C Drama",
-    "import_arb": "Arabic",
+    "import_c": "CT Drama",
+    "import_glb": "Global",
     "import_pak": "Pakistan",
     "import_anime": "Anime",
 }
 
 POSTER_CATEGORY_COMMANDS = {
-    "add_poster": "Hindi Dubbed",
-    "add_poster_regional": "Regional",
+    "add_poster_hindi": "K-Hindi",
+    "add_poster_orig": "K-Original",
     "add_poster_jap": "Japanese Drama",
-    "add_poster_c": "C Drama",
-    "add_poster_arb": "Arabic",
+    "add_poster_c": "CT Drama",
+    "add_poster_glb": "Global",
     "add_poster_pak": "Pakistan",
     "add_poster_anime": "Anime",
 }
 
 DELETE_CATEGORY_COMMANDS = {
-    "delete": "Hindi Dubbed",
-    "delete_regional": "Regional",
+    "delete_hindi": "K-Hindi",
+    "delete_orig": "K-Original",
     "delete_jap": "Japanese Drama",
-    "delete_c": "C Drama",
-    "delete_arb": "Arabic",
+    "delete_c": "CT Drama",
+    "delete_glb": "Global",
     "delete_pak": "Pakistan",
     "delete_anime": "Anime",
 }
 
 CATEGORY_ALIASES = {
-    "hindi": "Hindi Dubbed",
-    "jap": "Japanese Drama",
+    "hindi": "K-Hindi",
+    "hindi_dubbed": "K-Hindi",
+    "hindi_dub": "K-Hindi",
+    "regional": "K-Original",
+    "orig": "K-Original",
+    "cdrama": "CT Drama",
+    "c": "CT Drama",
+    "arabic": "Global",
+    "glb": "Global",
+    "global": "Global",
     "japanese": "Japanese Drama",
-    "c": "C Drama",
-    "chinese": "C Drama",
-    "arb": "Arabic",
-    "arabic": "Arabic",
-    "regional": "Regional",
-    "pak": "Pakistan",
+    "jap": "Japanese Drama",
     "pakistan": "Pakistan",
+    "pak": "Pakistan",
     "anime": "Anime"
 }
 
@@ -274,7 +278,6 @@ async def handle_import_receive(client: Client, message: Message):
         show_cache.clear()
 
         await proc.edit(f"✅ Success! Updated **S{season} E{ep_idx+1}** [{quality}] for **{show_name}**.")
-        asyncio.create_task(trigger_backup())
         
         # Log recent update
         asyncio.create_task(add_recent_update(category, show_name, season, ep_idx + 1))
@@ -292,7 +295,7 @@ async def handle_import_receive(client: Client, message: Message):
 async def add_poster_command(client: Client, message: Message):
     """Initiate poster upload mode."""
     cmd = message.command[0]
-    category = POSTER_CATEGORY_COMMANDS.get(cmd, "Hindi Dubbed")
+    category = POSTER_CATEGORY_COMMANDS.get(cmd, "K-Hindi")
     
     try:
         show_input = message.text.split(" ", 1)[1].strip()
@@ -400,7 +403,7 @@ async def add_show_cmd(client: Client, message: Message):
         )
 
     args = message.text.split(" ", 1)[1].strip()
-    category = "Hindi Dubbed"
+    category = "K-Hindi"
     show_name = None
     season_number = None
 
@@ -408,6 +411,9 @@ async def add_show_cmd(client: Client, message: Message):
     cmd_cat = cmd.replace("add_", "")
     if cmd_cat in CATEGORY_ALIASES:
         category = CATEGORY_ALIASES[cmd_cat]
+    elif cmd == "add" and not args.startswith(">"):
+        # Default for /add is K-Hindi
+        category = "K-Hindi"
 
     if ">" in args:
         try:
@@ -446,7 +452,6 @@ async def add_show_cmd(client: Client, message: Message):
                 "created_at": datetime.now()
             })
             await message.reply(f"Added show: **{show_name}** under **{category}**")
-            asyncio.create_task(trigger_backup())
         
         if season_number:
             season_key = normalize_season(season_number)
@@ -457,7 +462,6 @@ async def add_show_cmd(client: Client, message: Message):
             )
             if res.modified_count:
                 await message.reply(f"Added **Season {season_key}** under **{show_name}**")
-                asyncio.create_task(trigger_backup())
             else:
                 await message.reply(f"ℹ️ Season {season_key} already exists for **{show_name}**.")
 
@@ -473,7 +477,7 @@ async def add_show_cmd(client: Client, message: Message):
 async def delete_command_handler(client: Client, message: Message):
     """Delete a show, season, episode, or quality."""
     cmd = message.command[0]
-    category = DELETE_CATEGORY_COMMANDS.get(cmd, "Hindi Dubbed")
+    category = DELETE_CATEGORY_COMMANDS.get(cmd, "K-Hindi")
 
     try:
         args_text = message.text.split(" ", 1)[1].strip()
@@ -538,7 +542,6 @@ async def delete_command_handler(client: Client, message: Message):
                 episodes[ep_idx] = ep
                 await db.shows.update_one({"_id": doc["_id"]}, {"$set": {f"episodes.{season_key}": episodes}})
                 from bot.utils.cache import show_cache; show_cache.clear()
-                asyncio.create_task(trigger_backup())
                 return await message.reply(f"✅ Deleted **{quality}** from **S{season_key} E{episode_num}** of **{actual_show_name}**.")
         return await message.reply("❌ Quality/Episode not found.")
 
@@ -550,7 +553,6 @@ async def delete_command_handler(client: Client, message: Message):
             episodes.pop(ep_idx)
             await db.shows.update_one({"_id": doc["_id"]}, {"$set": {f"episodes.{season_key}": episodes}})
             from bot.utils.cache import show_cache; show_cache.clear()
-            asyncio.create_task(trigger_backup())
             return await message.reply(f"✅ Deleted **S{season_key} E{episode_num}** from **{actual_show_name}**.")
         return await message.reply("❌ Episode not found.")
         
@@ -559,14 +561,12 @@ async def delete_command_handler(client: Client, message: Message):
         if season_key in doc.get("episodes", {}):
             await db.shows.update_one({"_id": doc["_id"]}, {"$unset": {f"episodes.{season_key}": ""}})
             from bot.utils.cache import show_cache; show_cache.clear()
-            asyncio.create_task(trigger_backup())
             return await message.reply(f"✅ Deleted **Season {season_key}** from **{actual_show_name}**.")
         return await message.reply("❌ Season not found.")
 
     res = await db.shows.delete_one({"_id": doc["_id"]})
     if res.deleted_count:
         from bot.utils.cache import show_cache; show_cache.clear()
-        asyncio.create_task(trigger_backup())
         return await message.reply(f"✅ Deleted entire show **{actual_show_name}** from {category}.")
     await message.reply("❌ Delete failed.")
 
@@ -1008,11 +1008,11 @@ def register_admin_data_handlers(app: Client):
     app.on_message(filters.command(list(IMPORT_CATEGORY_MAP.keys())) & admin_filter & filters.private)(import_command_handler)
     
     # Poster commands
-    app.on_message(filters.command(list(POSTER_CATEGORY_COMMANDS.keys())) & admin_filter & filters.private)(add_poster_command)
+    app.on_message(filters.command(list(POSTER_CATEGORY_COMMANDS.keys()) + ["add_poster"]) & admin_filter & filters.private)(add_poster_command)
     
     # General Admin
-    app.on_message(filters.command(["add", "add_hindi", "add_regional", "add_jap", "add_c", "add_arb", "add_pak", "add_anime"]) & admin_filter & filters.private)(add_show_cmd)
-    app.on_message(filters.command(list(DELETE_CATEGORY_COMMANDS.keys())) & admin_filter & filters.private)(delete_command_handler)
+    app.on_message(filters.command(["add", "add_hindi", "add_orig", "add_jap", "add_c", "add_glb", "add_pak", "add_anime"]) & admin_filter & filters.private)(add_show_cmd)
+    app.on_message(filters.command(list(DELETE_CATEGORY_COMMANDS.keys()) + ["delete"]) & admin_filter & filters.private)(delete_command_handler)
     app.on_message(filters.command("get") & admin_filter & filters.private)(get_link_cmd)
     app.on_message(filters.command("user_search") & admin_filter & filters.private)(user_search_cmd)
     app.on_message(filters.command("report_search") & admin_filter & filters.private)(report_search_cmd)

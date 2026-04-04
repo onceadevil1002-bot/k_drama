@@ -19,7 +19,9 @@ async def load_data():
     try:
         cursor = db.shows.find({}, projection)
         async for doc in cursor:
-            category = doc.get("category", "Hindi Dubbed")
+            category = doc.get("category", "K-Hindi")
+            if category == "Hindi Dubbed":
+                category = "K-Hindi"
             show_name = doc["show_name"]
             episodes = doc.get("episodes", {})
             poster = doc.get("poster", [])

@@ -144,7 +144,7 @@ async def favorites_cmd(client: Client, message: Message):
     await message.reply("⭐ **Your Favorites:**", reply_markup=InlineKeyboardMarkup(btn_rows))
 
 async def recent_updates_cmd(client: Client, message: Message):
-    updates = await get_recent_updates(50)
+    updates = await get_recent_updates(1000)
     formatted = get_formatted_recent_updates(updates)
     
     if not formatted:
@@ -286,7 +286,7 @@ async def start_cmd(client: Client, message: Message):
                         ])
                     buttons.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_main")])
                     return await message.reply(
-                        f"📂 **{matched_category}**\n\nSelect a show:",
+                        text=f"📂 Category: **{matched_category}**\n\nSelect a show:",
                         reply_markup=InlineKeyboardMarkup(buttons)
                     )
         except Exception as e:

@@ -31,8 +31,11 @@ async def create_json_backup() -> str:
                 return obj.isoformat()
             return str(obj)
 
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, default=json_serial)
+        def _dump_sync():
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4, default=json_serial)
+                
+        await asyncio.to_thread(_dump_sync)
             
         logger.info(f"💾 Database backed up successfully: {filename}")
         return filepath

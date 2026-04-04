@@ -40,12 +40,13 @@ from bot.utils.ids import make_id
 async def main_keyboard():
     """Build the main category keyboard with hashed IDs."""
     cats = [
-        ("🎞 Hindi Dubbed", "Hindi Dubbed"),
+        ("🎙️ K-Hindi", "K-Hindi"),
         ("🎌 Japanese Drama", "Japanese Drama"),
-        ("📺 C Drama", "C Drama"),
-        ("🌙 Arabic", "Arabic"),
+        ("🏮 CT Drama", "CT Drama"),
+        ("🌍 Global", "Global"),
         ("🇵🇰 Pakistan", "Pakistan"),
-        ("🎨 Anime", "Anime")
+        ("🎨 Anime", "Anime"),
+        ("🎌 K-Original", "K-Original")
     ]
     
     buttons = []
