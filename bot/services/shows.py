@@ -5,8 +5,31 @@ from bot.utils.cache import show_cache
 
 logger = logging.getLogger(__name__)
 
+# ─── Legacy → Canonical category name map ────────────────────────────────────
+# ONLY add entries here for categories that were renamed.
+# The DB records are NOT modified — this is a runtime-only normalization.
+_LEGACY_CATEGORY_MAP = {
+    # Old Hindi-dubbed names
+    "Hindi Dubbed":  "K-Hindi",
+    "Hindi Dub":     "K-Hindi",
+    "hindi dubbed":  "K-Hindi",
+    "hindi dub":     "K-Hindi",
+    # Old regional/original names
+    "Regional":      "K-Original",
+    "regional":      "K-Original",
+    # Old C-Drama names
+    "C Drama":       "CT Drama",
+    "c drama":       "CT Drama",
+    "CDrama":        "CT Drama",
+    "cdrama":        "CT Drama",
+    # Old Global/Arabic names
+    "Arabic":        "Global",
+    "arabic":        "Global",
+}
+
+
 async def load_data():
-    """Load show data from MongoDB."""
+    """Load show data from MongoDB, normalizing legacy category names."""
     data = {}
     projection = {
         "category": 1,
@@ -15,13 +38,18 @@ async def load_data():
         "poster": 1,
         "_id": 0
     }
-    
+
     try:
         cursor = db.shows.find({}, projection)
         async for doc in cursor:
-            category = doc.get("category", "K-Hindi")
-            if category == "Hindi Dubbed":
-                category = "K-Hindi"
+            raw_category = doc.get("category", "K-Hindi")
+            # Normalize any old category name to the current canonical name
+            category = _LEGACY_CATEGORY_MAP.get(raw_category, raw_category)
+            if category != raw_category:
+                logger.debug(
+                    f"load_data: normalized category '{raw_category}' → '{category}' "
+                    f"for show '{doc.get('show_name', '?')}'"
+                )
             show_name = doc["show_name"]
             episodes = doc.get("episodes", {})
             poster = doc.get("poster", [])

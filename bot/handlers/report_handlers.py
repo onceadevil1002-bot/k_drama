@@ -111,11 +111,17 @@ async def handle_report_text(client: Client, message: Message):
                 ]
                 
                 await client.send_message(
-                    admin, 
+                    admin,
                     caption,
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
-            except: pass
+                logger.info(f"Report {report_id} notification sent to admin {admin}")
+            except Exception as notify_err:
+                # Log exact error so we can diagnose why admin isn't receiving notifications
+                logger.error(
+                    f"Failed to notify admin {admin} of report {report_id}: "
+                    f"{type(notify_err).__name__}: {notify_err}"
+                )
     else:
         await message.reply("❌ Error submitting report.")
 
@@ -141,7 +147,8 @@ async def report_status_handler(client: Client, callback_query: CallbackQuery):
             
             try:
                 await client.send_message(user_target_id, msg)
-            except: pass
+            except Exception as e:
+                logger.warning(f"Could not notify user {user_target_id} of report status update: {e}")
             
         await callback_query.message.edit_text(f"✅ Report {new_status.capitalize()}")
         await safe_answer(callback_query, f"Report {new_status}")
@@ -153,5 +160,12 @@ def register_report_handlers(app: Client):
     app.on_callback_query(filters.regex(r"^report$"))(report_main_cb)
     app.on_callback_query(filters.regex(r"^report\|"))(report_callback_handler)
     app.on_callback_query(filters.regex(r"^report_status\|"))(report_status_handler)
-    # Filter for non-command text messages in private chat by ensuring it doesn't start with /
-    app.on_message(filters.text & filters.private & ~filters.regex(r"^/"))(handle_report_text)
+    # CRITICAL: Must be group=1, NOT group=0.
+    # handle_import_receive in admin_data_entry.py is registered at group=0 for ALL private
+    # text messages. In Pyrogram, only the first matching handler per group fires.
+    # By using group=1, this handler always runs after group=0, so user reports are
+    # never silently swallowed by the import handler.
+    app.on_message(
+        filters.text & filters.private & ~filters.regex(r"^/"),
+        group=1
+    )(handle_report_text)

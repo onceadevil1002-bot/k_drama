@@ -7,11 +7,12 @@ from pyrogram.errors import MessageNotModified, QueryIdInvalid, FloodWait, RPCEr
 from bot.utils.ui import main_keyboard, auto_delete_message, safe_answer, update_media_or_text
 from bot.utils.ids import make_id, resolve_id, normalize_show_slug
 from bot.utils.logger import track_performance
-from bot.services.shows import get_cached_data, increment_view
+from bot.services.shows import get_cached_data, increment_view, _LEGACY_CATEGORY_MAP
 from bot.services.favorites import add_favorite, remove_favorite, is_favorited
 from bot.services.sessions import create_group_session, get_group_session
 from bot.config import ADMIN_IDS, get_category_emoji
 from bot.utils.behavior import track_behavior
+from bot.utils.slug import find_show_in_data
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ async def category_handler(client, callback_query: CallbackQuery):
         category = await resolve_id(cat_id)
         
         data = await get_cached_data()
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
         if category not in data:
             return await safe_answer(callback_query, "Category not found.", show_alert=True)
             
@@ -76,7 +80,9 @@ async def pagination_handler(client, callback_query: CallbackQuery):
         
         category = await resolve_id(cat_id)
         data = await get_cached_data()
-        
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
         if category not in data:
             return await safe_answer(callback_query, "Category not found.", show_alert=True)
             
@@ -120,11 +126,21 @@ async def show_handler(client, callback_query: CallbackQuery):
         show_id = parts[2]
         
         category = await resolve_id(cat_id)
-        show_name = await resolve_id(show_id)
+        raw_show_name = await resolve_id(show_id)
         
         data = await get_cached_data()
-        if category not in data or show_name not in data[category]:
-            return await safe_answer(callback_query, "Show not found.", show_alert=True)
+        
+        # 1. Handle legacy category fallback
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        # 2. Case-insensitive/slug-resilient show lookup
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name:
+            return await safe_answer(callback_query, f"Show '{raw_show_name}' not found.", show_alert=True)
             
         show_data = data[category][show_name]
         seasons = sorted([k for k in show_data.keys() if k not in ["poster", "episodes"]])
@@ -215,10 +231,23 @@ async def season_handler(client, callback_query: CallbackQuery):
         cat_id, show_id, s_id = parts[1], parts[2], parts[3]
         
         category = await resolve_id(cat_id)
-        show_name = await resolve_id(show_id)
+        raw_show_name = await resolve_id(show_id)
         season = await resolve_id(s_id)
         
         data = await get_cached_data()
+        
+        # Category Fallback
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        # Robust show lookup
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name or season not in data[category][show_name]:
+            return await safe_answer(callback_query, "Season not found.", show_alert=True)
+            
         episodes = data[category][show_name][season]
         
         buttons = []
@@ -251,10 +280,23 @@ async def episode_handler(client, callback_query: CallbackQuery):
         cat_id, show_id, s_id, ep_idx = parts[1], parts[2], parts[3], int(parts[4])
         
         category = await resolve_id(cat_id)
-        show_name = await resolve_id(show_id)
+        raw_show_name = await resolve_id(show_id)
         season = await resolve_id(s_id) if s_id != "flat" else "episodes"
         
         data = await get_cached_data()
+        
+        # Category Fallback
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        # Robust show lookup
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name or season not in data[category][show_name]:
+             return await safe_answer(callback_query, "Show data missing.", show_alert=True)
+             
         episode_data = data[category][show_name][season][ep_idx-1]
         
         # Handle multi-quality
@@ -292,10 +334,23 @@ async def multi_handler(client: Client, callback_query: CallbackQuery):
         cat_id, show_id, s_id, ep_idx = parts[1], parts[2], parts[3], int(parts[4])
         
         category = await resolve_id(cat_id)
-        show_name = await resolve_id(show_id)
+        raw_show_name = await resolve_id(show_id)
         season = await resolve_id(s_id) if s_id != "flat" else "episodes"
         
         data = await get_cached_data()
+        
+        # Category Fallback
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        # Robust show lookup
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name or season not in data[category][show_name]:
+            return await safe_answer(callback_query, "Data not found.", show_alert=True)
+            
         parts_list = data[category][show_name][season][ep_idx-1]
         
         buttons = []
@@ -321,10 +376,23 @@ async def quality_handler(client: Client, callback_query: CallbackQuery):
         cat_id, show_id, s_id, ep_idx, quality = parts[1], parts[2], parts[3], int(parts[4]), parts[5]
         
         category = await resolve_id(cat_id)
-        show_name = await resolve_id(show_id)
+        raw_show_name = await resolve_id(show_id)
         season = await resolve_id(s_id) if s_id != "flat" else "episodes"
         
         data = await get_cached_data()
+        
+        # Category Fallback
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        # Robust show lookup
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name or season not in data[category][show_name]:
+            return await safe_answer(callback_query, "Data not found.", show_alert=True)
+            
         episode_data = data[category][show_name][season][ep_idx-1]
         media_data = episode_data["qualities"][quality]
         
@@ -340,10 +408,23 @@ async def splitpart_handler(client: Client, callback_query: CallbackQuery):
         cat_id, show_id, s_id, ep_idx, p_idx = parts[1], parts[2], parts[3], int(parts[4]), int(parts[5])
         
         category = await resolve_id(cat_id)
-        show_name = await resolve_id(show_id)
+        raw_show_name = await resolve_id(show_id)
         season = await resolve_id(s_id) if s_id != "flat" else "episodes"
         
         data = await get_cached_data()
+        
+        # Category Fallback
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        # Robust show lookup
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name or season not in data[category][show_name]:
+            return await safe_answer(callback_query, "Data not found.", show_alert=True)
+            
         episode_data = data[category][show_name][season][ep_idx-1]
         file_id = episode_data[p_idx-1]
         
