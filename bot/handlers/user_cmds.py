@@ -30,11 +30,15 @@ async def _build_join_buttons(client, missing_channels: list) -> list:
             if chat.username:
                 url = f"https://t.me/{chat.username}"
             else:
-                url = getattr(chat, "invite_link", None) or f"https://t.me/{str(config_name).lstrip('@')}"
+                url = getattr(chat, "invite_link", None)
+                if not url:
+                    ch_str = str(config_name).lstrip("@")
+                    url = str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}"
             buttons.append([InlineKeyboardButton(f"📢 Join {title}", url=url)])
         except Exception:
             ch_str = str(config_name).lstrip("@")
-            buttons.append([InlineKeyboardButton(f"📢 Join Channel", url=f"https://t.me/{ch_str}")])
+            url = str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}"
+            buttons.append([InlineKeyboardButton(f"📢 Join Channel", url=url)])
     buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="joined")])
     return buttons
 

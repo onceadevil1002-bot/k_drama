@@ -140,10 +140,10 @@ async def import_command_handler(client: Client, message: Message):
 
     # Parsing (Same logic as monolith)
     # 1. Quoted: "Show Name" S1 E3 720p
-    match = re.match(r'"([^"]+)"\s+[Ss](\d+)\s+[Ee](\d+)\s+(\d+)p?', args_text)
+    match = re.match(r'"([^"]+)"\s+[Ss](\d+)\s+[Ee](\d+)\s+(\d+)p?(?:\s+[Pp](\d+))?', args_text)
     if not match:
         # 2. Unquoted: Show_Name S1 E3 720p or Show Name S1 E3 720p
-        match = re.match(r'(.+?)\s+[Ss](\d+)\s+[Ee](\d+)\s+(\d+)p?', args_text)
+        match = re.match(r'(.+?)\s+[Ss](\d+)\s+[Ee](\d+)\s+(\d+)p?(?:\s+[Pp](\d+))?', args_text)
 
     if not match:
         return await message.reply(
@@ -156,6 +156,7 @@ async def import_command_handler(client: Client, message: Message):
     season_str = match.group(2)
     episode_num = int(match.group(3))
     quality = match.group(4) + "p" if not match.group(4).endswith("p") else match.group(4)
+    part_num = int(match.group(5)) if match.group(5) else None
 
     # Validate Show and Category
     data = await get_cached_data()
@@ -182,6 +183,7 @@ async def import_command_handler(client: Client, message: Message):
         "season": season_key,
         "episode_index": episode_num - 1,
         "quality": quality,
+        "part_num": part_num,
         "timestamp": time.time()  # For stale-state detection
     }
 
@@ -231,6 +233,7 @@ async def handle_import_receive(client: Client, message: Message):
         season = state["season"]
         ep_idx = state["episode_index"]
         quality = state["quality"]
+        part_num = state.get("part_num")
 
         # Update MongoDB
         # We store multi-quality episodes as list of dicts at index
@@ -243,29 +246,48 @@ async def handle_import_receive(client: Client, message: Message):
             return
 
         episodes = show_doc.get("episodes", {}).get(season, [])
-        # Ensure list is long enough
-        while len(episodes) <= ep_idx:
-            episodes.append({})
-        
-        # Add specific quality
-        current_ep = episodes[ep_idx]
-        if not isinstance(current_ep, dict):
-            # Convert legacy single-file ep to multi-quality dict
-            current_ep = {"qualities": {"default": {"type": "video", "content": current_ep}}} if current_ep else {"qualities": {}}
+        # Initialize if missing
+        if ep_idx >= len(episodes):
+            episodes.extend([None] * (ep_idx - len(episodes) + 1))
             
-        if "qualities" not in current_ep:
-            if "type" in current_ep:
-                current_ep = {"qualities": {"default": current_ep}}
+        current_ep = episodes[ep_idx]
+        
+        # Backward compatibility for old format
+        if not isinstance(current_ep, dict):
+            if current_ep:
+                current_ep = {"qualities": {"default": {"type": "video", "content": current_ep}}}
             else:
-                migrated_quals = {}
-                for q, v in current_ep.items():
-                    if isinstance(v, str):
-                        migrated_quals[q] = {"type": "link" if v.startswith("http") else "video", "content": v}
-                    else:
-                        migrated_quals[q] = v
-                current_ep = {"qualities": migrated_quals}
+                current_ep = {"qualities": {}}
                 
-        current_ep["qualities"][quality] = {"type": file_type, "content": file_id}
+        if "qualities" not in current_ep:
+            current_ep["qualities"] = {}
+
+        if part_num is not None:
+            # Handle as a split part
+            existing_q = current_ep["qualities"].get(quality)
+            if not isinstance(existing_q, list):
+                if existing_q:
+                    existing_q = [existing_q]
+                else:
+                    existing_q = []
+            
+            part_idx = part_num - 1
+            while len(existing_q) <= part_idx:
+                existing_q.append(None)
+                
+            existing_q[part_idx] = {"type": file_type, "content": file_id}
+            
+            # Clean up trailing Nones just in case
+            while existing_q and existing_q[-1] is None:
+                existing_q.pop()
+                
+            current_ep["qualities"][quality] = existing_q
+            part_msg = f" Part {part_num}"
+        else:
+            # Handle as single quality file
+            current_ep["qualities"][quality] = {"type": file_type, "content": file_id}
+            part_msg = ""
+            
         episodes[ep_idx] = current_ep
 
         await db.shows.update_one(
@@ -277,7 +299,7 @@ async def handle_import_receive(client: Client, message: Message):
         from bot.utils.cache import show_cache
         show_cache.clear()
 
-        await proc.edit(f"✅ Success! Updated **S{season} E{ep_idx+1}** [{quality}] for **{show_name}**.")
+        await safe_answer(message, f"✅ Saved **{state['show']}** S{season.replace('season_', '')} E{ep_idx+1} ({quality}{part_msg}) successfully!")
         
         # Log recent update
         asyncio.create_task(add_recent_update(category, show_name, season, ep_idx + 1))

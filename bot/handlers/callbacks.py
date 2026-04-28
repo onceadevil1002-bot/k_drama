@@ -396,9 +396,54 @@ async def quality_handler(client: Client, callback_query: CallbackQuery):
         episode_data = data[category][show_name][season][ep_idx-1]
         media_data = episode_data["qualities"][quality]
         
+        if isinstance(media_data, list):
+            buttons = []
+            for idx, part_data in enumerate(media_data, 1):
+                if part_data is not None:
+                    buttons.append([InlineKeyboardButton(f"▶️ Part {idx}", callback_data=f"qpart|{cat_id}|{show_id}|{s_id}|{ep_idx}|{quality}|{idx}")])
+                
+            buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"episode|{cat_id}|{show_id}|{s_id}|{ep_idx}")])
+            
+            await update_media_or_text(
+                callback_query.message,
+                f"🎬 **{show_name}** - Ep {ep_idx} ({quality} Split Parts)\nSelect a part:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+            return await safe_answer(callback_query)
+
         await send_media(client, callback_query, category, f"{show_name} ({quality})", ep_idx, media_data)
     except Exception as e:
         logger.exception(f"quality_handler error: {e}")
+
+@track_performance("qpart_handler")
+async def qpart_handler(client: Client, callback_query: CallbackQuery):
+    """Handle split part playback inside a specific quality."""
+    try:
+        parts = callback_query.data.split("|")
+        cat_id, show_id, s_id, ep_idx, quality, p_idx = parts[1], parts[2], parts[3], int(parts[4]), parts[5], int(parts[6])
+        
+        category = await resolve_id(cat_id)
+        raw_show_name = await resolve_id(show_id)
+        season = await resolve_id(s_id) if s_id != "flat" else "episodes"
+        
+        data = await get_cached_data()
+        
+        if category not in data:
+            category = _LEGACY_CATEGORY_MAP.get(category, category)
+            
+        if category not in data:
+            return await safe_answer(callback_query, "Category not found.", show_alert=True)
+
+        show_name = find_show_in_data(data, category, raw_show_name)
+        if not show_name or season not in data[category][show_name]:
+            return await safe_answer(callback_query, "Data not found.", show_alert=True)
+            
+        episode_data = data[category][show_name][season][ep_idx-1]
+        media_data = episode_data["qualities"][quality][p_idx-1]
+        
+        await send_media(client, callback_query, category, f"{show_name} ({quality}) Part {p_idx}", ep_idx, media_data)
+    except Exception as e:
+        logger.exception(f"qpart_handler error: {e}")
 
 @track_performance("splitpart_handler")
 async def splitpart_handler(client: Client, callback_query: CallbackQuery):
@@ -555,6 +600,7 @@ def register_callback_handlers(app: Client):
     app.on_callback_query(filters.regex(r"^episode\|"))(episode_handler)
     app.on_callback_query(filters.regex(r"^multi\|"))(multi_handler)
     app.on_callback_query(filters.regex(r"^qual\|"))(quality_handler)
+    app.on_callback_query(filters.regex(r"^qpart\|"))(qpart_handler)
     app.on_callback_query(filters.regex(r"^splitpart\|"))(splitpart_handler)
     app.on_callback_query(filters.regex(r"^fav_"))(fav_toggle_handler)
     app.on_callback_query(filters.regex(r"^back_to_main$"))(back_to_main_handler)
