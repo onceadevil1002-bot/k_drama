@@ -22,9 +22,12 @@ async def _build_join_buttons(client, missing_channels: list) -> list:
     numeric_id may be None if channels not resolved yet — falls back to config_name.
     """
     buttons = []
+    logger.debug(f"_build_join_buttons called with {len(missing_channels)} missing channels")
+    
     for config_name, numeric_id in missing_channels:
         try:
             lookup = numeric_id if numeric_id is not None else config_name
+            logger.debug(f"Getting chat info for {config_name} (lookup={lookup})")
             chat = await client.get_chat(lookup)
             title = chat.title or "Required Channel"
             if chat.username:
@@ -34,12 +37,17 @@ async def _build_join_buttons(client, missing_channels: list) -> list:
                 if not url:
                     ch_str = str(config_name).lstrip("@")
                     url = str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}"
+            logger.debug(f"Created button for {title} with url {url}")
             buttons.append([InlineKeyboardButton(f"📢 Join {title}", url=url)])
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to get chat info for {config_name}: {e}")
             ch_str = str(config_name).lstrip("@")
             url = str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}"
+            logger.debug(f"Using fallback url {url}")
             buttons.append([InlineKeyboardButton(f"📢 Join Channel", url=url)])
+    
     buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="joined")])
+    logger.debug(f"Returning {len(buttons)} button rows")
     return buttons
 
 async def _gate_check(client, user_id: int, reply_fn) -> bool:
@@ -77,6 +85,8 @@ async def _gate_check(client, user_id: int, reply_fn) -> bool:
     if missing:
         # Abuse detection — runs here because Telegram leave events are unreliable
         leave_count = await get_leave_count(user_id)
+        
+        logger.info(f"User {user_id} is missing channels: leave_count={leave_count}, missing={len(missing)} channels")
 
         if leave_count >= 4:
             # Check if already banned (may have been banned mid-session)
@@ -90,6 +100,7 @@ async def _gate_check(client, user_id: int, reply_fn) -> bool:
                     username, full_name = "", str(user_id)
                 await ban_user(user_id, username, full_name, leave_count)
                 bot_me = await client.get_me()
+                logger.info(f"User {user_id} banned due to repeated leaving")
                 await reply_fn(
                     "⛔ **You have been banned from using this bot.**\n\n"
                     "You repeatedly joined and left the required channels.\n"
@@ -107,6 +118,7 @@ async def _gate_check(client, user_id: int, reply_fn) -> bool:
             await set_warned(user_id)
             # Send warning as separate message, still show join buttons
             try:
+                logger.info(f"User {user_id} warned due to repeated leaving")
                 await client.send_message(
                     user_id,
                     "⚠️ **Warning!**\n\n"
@@ -114,15 +126,20 @@ async def _gate_check(client, user_id: int, reply_fn) -> bool:
                     "If you do this **one more time**, you will be permanently "
                     "banned from using this bot."
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Failed to send warning to user {user_id}: {e}")
 
-        buttons = await _build_join_buttons(client, missing)
-        await reply_fn(
-            "🎬 **Welcome to K-Drama Bot!**\n\n"
-            "To use the bot please join our required channels first:",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        try:
+            logger.info(f"Building join buttons for user {user_id} for {len(missing)} channels")
+            buttons = await _build_join_buttons(client, missing)
+            logger.info(f"Sending join message with {len(buttons)} button rows to user {user_id}")
+            await reply_fn(
+                "🎬 **Welcome to K-Drama Bot!**\n\n"
+                "To use the bot please join our required channels first:",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        except Exception as e:
+            logger.exception(f"Failed to send join buttons message to user {user_id}: {e}")
         return False
 
     return True
@@ -243,7 +260,15 @@ async def start_cmd(client: Client, message: Message):
 
     # Ban + membership gate
     if loader: await loader.delete()
-    if not await _gate_check(client, user_id, message.reply):
+    try:
+        if not await _gate_check(client, user_id, message.reply):
+            return
+    except Exception as e:
+        logger.exception(f"_gate_check failed for user {user_id}: {e}")
+        try:
+            await message.reply("❌ An error occurred. Please try again.")
+        except Exception as e2:
+            logger.exception(f"Failed to send error message: {e2}")
         return
 
     # Deep link handling

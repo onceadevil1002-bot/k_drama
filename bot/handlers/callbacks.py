@@ -400,13 +400,16 @@ async def quality_handler(client: Client, callback_query: CallbackQuery):
             buttons = []
             for idx, part_data in enumerate(media_data, 1):
                 if part_data is not None:
-                    buttons.append([InlineKeyboardButton(f"▶️ Part {idx}", callback_data=f"qpart|{cat_id}|{show_id}|{s_id}|{ep_idx}|{quality}|{idx}")])
+                    # Compact format: qp|cat|show|season|ep.quality.part
+                    # Keeps under Telegram's 64-byte callback limit
+                    cb_data = f"qp|{cat_id}|{show_id}|{s_id}|{ep_idx}.{quality}.{idx}"
+                    buttons.append([InlineKeyboardButton(f"▶️ Part {idx}", callback_data=cb_data)])
                 
             buttons.append([InlineKeyboardButton("🔙 Back", callback_data=f"episode|{cat_id}|{show_id}|{s_id}|{ep_idx}")])
             
             await update_media_or_text(
                 callback_query.message,
-                f"🎬 **{show_name}** - Ep {ep_idx} ({quality} Split Parts)\nSelect a part:",
+                f"🎬 **{show_name}** - Ep {ep_idx} ({quality})\nSelect a part:",
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
             return await safe_answer(callback_query)
@@ -419,8 +422,12 @@ async def quality_handler(client: Client, callback_query: CallbackQuery):
 async def qpart_handler(client: Client, callback_query: CallbackQuery):
     """Handle split part playback inside a specific quality."""
     try:
+        # Compact format: qp|cat_id|show_id|s_id|ep.quality.part
         parts = callback_query.data.split("|")
-        cat_id, show_id, s_id, ep_idx, quality, p_idx = parts[1], parts[2], parts[3], int(parts[4]), parts[5], int(parts[6])
+        cat_id, show_id, s_id = parts[1], parts[2], parts[3]
+        # Last segment packs ep_idx, quality, and part_idx with dots
+        tail = parts[4].split(".")
+        ep_idx, quality, p_idx = int(tail[0]), tail[1], int(tail[2])
         
         category = await resolve_id(cat_id)
         raw_show_name = await resolve_id(show_id)
@@ -567,17 +574,37 @@ from bot.handlers.user_cmds import _build_join_buttons
 async def joined_handler(client: Client, callback_query: CallbackQuery):
     """Handle I Joined button — live check then DB sync."""
     user_id = callback_query.from_user.id
+    logger.info(f"joined_handler called for user {user_id}")
+    
     missing = await get_missing_channels(user_id)
+    logger.debug(f"get_missing_channels returned {len(missing)} missing channels")
+    
     if missing:
+        logger.info(f"User {user_id} has missing channels, calling live_check_and_sync")
         missing = await live_check_and_sync(client, user_id)
+        logger.debug(f"live_check_and_sync returned {len(missing)} missing channels")
+    
     if missing:
+        logger.info(f"User {user_id} still missing channels after live check, rebuilding buttons")
         buttons = await _build_join_buttons(client, missing)
+        text = "🎬 **Welcome to K-Drama Bot!**\n\nTo use the bot please join our required channels first:"
+        markup = InlineKeyboardMarkup(buttons)
         await safe_answer(callback_query, "You still need to join some channels.", show_alert=True)
         try:
-            await callback_query.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(buttons))
+            await callback_query.message.edit_text(text, reply_markup=markup)
+        except MessageNotModified:
+            logger.debug(f"Message not modified for user {user_id}")
+            pass
         except Exception as e:
-            logger.debug(f"joined_handler: edit_reply_markup failed: {e}")
+            logger.warning(f"joined_handler: edit_text failed for user {user_id}: {e}")
+            try:
+                await callback_query.message.delete()
+                await client.send_message(callback_query.message.chat.id, text, reply_markup=markup)
+            except Exception as e2:
+                logger.warning(f"joined_handler: fallback send failed for user {user_id}: {e2}")
         return
+    
+    logger.info(f"User {user_id} verification complete, showing main menu")
     await safe_answer(callback_query, "✅ Membership verified!")
     text = "🎬 **Welcome back!**\n\nChoose a category to browse:"
     markup = await main_keyboard()
@@ -588,9 +615,10 @@ async def joined_handler(client: Client, callback_query: CallbackQuery):
         try:
             await callback_query.message.edit_text(text, reply_markup=markup)
         except MessageNotModified:
+            logger.debug(f"Message not modified for user {user_id}")
             pass
         except Exception as e:
-            logger.debug(f"joined_handler: edit_text failed: {e}")
+            logger.debug(f"joined_handler: edit_text failed for user {user_id}: {e}")
 
 def register_callback_handlers(app: Client):
     app.on_callback_query(filters.regex(r"^cat\|"))(category_handler)
@@ -600,7 +628,7 @@ def register_callback_handlers(app: Client):
     app.on_callback_query(filters.regex(r"^episode\|"))(episode_handler)
     app.on_callback_query(filters.regex(r"^multi\|"))(multi_handler)
     app.on_callback_query(filters.regex(r"^qual\|"))(quality_handler)
-    app.on_callback_query(filters.regex(r"^qpart\|"))(qpart_handler)
+    app.on_callback_query(filters.regex(r"^qp\|"))(qpart_handler)
     app.on_callback_query(filters.regex(r"^splitpart\|"))(splitpart_handler)
     app.on_callback_query(filters.regex(r"^fav_"))(fav_toggle_handler)
     app.on_callback_query(filters.regex(r"^back_to_main$"))(back_to_main_handler)

@@ -237,7 +237,16 @@ async def _handle_detected_leave(user_id: int, numeric_id: int):
         # Never joined or already marked left — just ensure status is correct
         await db.channel_members.update_one(
             {"user_id": user_id, "channel_id": key},
-            {"$set": {"status": "left"}},
+            {
+                "$set": {"status": "left", "last_left": now},
+                "$setOnInsert": {
+                    "join_count": 0,
+                    "leave_count": 0,
+                    "warned": False,
+                    "first_seen": now,
+                    "history": [{"event": "leave_detected_live", "timestamp": now}]
+                }
+            },
             upsert=True
         )
 
@@ -313,7 +322,9 @@ async def get_leave_count(user_id: int) -> int:
         {"$group": {"_id": "$user_id", "max_leaves": {"$max": "$leave_count"}}}
     ]
     result = await db.channel_members.aggregate(pipeline).to_list(1)
-    return result[0]["max_leaves"] if result else 0
+    max_leaves = result[0]["max_leaves"] if result else None
+    # Handle case where field doesn't exist (returns null from $max aggregation)
+    return max_leaves if isinstance(max_leaves, int) and max_leaves >= 0 else 0
 
 
 # ---------------------------------------------------------------------------
