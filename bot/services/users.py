@@ -128,8 +128,7 @@ async def _upsert_user_task(client, user, chat=None, force_photo=False):
                                 old_tmp = await client.download_media(old_doc["profile_pic"])
                                 if old_tmp:
                                     old_sent = await client.send_photo(
-                                        STORAGE_CHANNEL_ID, old_tmp,
-                                        caption=f"📸 Past Profile Pic\nID: {user_id} @{username}"
+                                        STORAGE_CHANNEL_ID, old_tmp
                                     )
                                     if old_sent and old_sent.photo:
                                         await db.userdb.update_one(
@@ -150,8 +149,7 @@ async def _upsert_user_task(client, user, chat=None, force_photo=False):
 
                         # Upload current photo to storage channel for permanent PHOTO file_id
                         curr_sent = await client.send_photo(
-                            STORAGE_CHANNEL_ID, tmp_path,
-                            caption=f"📸 Current Profile Pic\nID: {user_id} @{username}"
+                            STORAGE_CHANNEL_ID, tmp_path
                         )
                         if curr_sent and curr_sent.photo:
                             photo_file_id = curr_sent.photo.file_id  # Proper PHOTO type

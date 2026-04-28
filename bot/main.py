@@ -27,6 +27,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+# Suppress noisy pymongo server-selection INFO logs during initial Atlas connection
+logging.getLogger("pymongo").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -53,13 +55,38 @@ class Bot(Client):
         await warm_hash_cache()
 
         # Step 3: Resolve storage channel peer
+        # Private channels can't be resolved by numeric ID alone on a cold
+        # session because Pyrogram needs an access hash in its peer cache.
+        # For bots that are admins/members of the channel, Telegram accepts
+        # access_hash=0 via raw API, which seeds the session's peer cache.
+        from bot.config import STORAGE_CHANNEL_ID
+        _storage_ok = False
         try:
-            from bot.config import STORAGE_CHANNEL_ID
             await self.get_chat(STORAGE_CHANNEL_ID)
+            _storage_ok = True
+        except Exception:
+            pass
+
+        if not _storage_ok:
+            try:
+                from pyrogram.raw.functions.channels import GetChannels
+                from pyrogram.raw.types import InputChannel
+                # Strip -100 prefix to get raw channel ID
+                raw_id = int(str(STORAGE_CHANNEL_ID).replace("-100", ""))
+                await self.invoke(
+                    GetChannels(id=[InputChannel(channel_id=raw_id, access_hash=0)])
+                )
+                # Now the peer is cached in the session — get_chat will work
+                await self.get_chat(STORAGE_CHANNEL_ID)
+                _storage_ok = True
+            except Exception as e:
+                logger.warning(f"Raw API storage channel resolution failed: {e}")
+
+        if _storage_ok:
             logger.info(f"Storage channel peer resolved: {STORAGE_CHANNEL_ID}")
-        except Exception as e:
+        else:
             logger.critical(
-                f"STORAGE CHANNEL UNREACHABLE: {STORAGE_CHANNEL_ID} — {e}. "
+                f"STORAGE CHANNEL UNREACHABLE: {STORAGE_CHANNEL_ID}. "
                 "Photo uploads will fail until this is resolved. "
                 "Verify STORAGE_CHANNEL_ID env var and bot membership."
             )

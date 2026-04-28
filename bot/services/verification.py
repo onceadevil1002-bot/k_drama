@@ -12,12 +12,12 @@ logger = logging.getLogger(__name__)
 # All DB operations use numeric IDs so they match Telegram event IDs exactly.
 # ---------------------------------------------------------------------------
 _resolved_channel_ids: dict = {}   # e.g. {"@Seoul_Entertainment_DKD": -1002648019848}
+_required_channel_info: dict = {}
 
-# Short-lived cache for live_check_and_sync results
-# Key: user_id, Value: (result_list, timestamp)
-# 5 minute TTL — balances accuracy vs API call reduction
+# Per-user live verification cache. This only affects calls to
+# live_check_and_sync, which should be used by /start and I Joined only.
 _verification_cache: dict = {}
-_VERIFICATION_TTL = 300  # seconds
+_VERIFICATION_TTL = 120  # seconds
 
 
 async def resolve_required_channels(client):
@@ -26,13 +26,24 @@ async def resolve_required_channels(client):
     Resolves every entry in REQUIRED_CHANNELS to a numeric ID via get_chat(),
     which also caches the peer in Pyrogram's session so numeric lookups work.
     """
-    global _resolved_channel_ids
+    global _resolved_channel_ids, _required_channel_info
     _resolved_channel_ids = {}
+    _required_channel_info = {}
     for ch in REQUIRED_CHANNELS:
         try:
             chat = await client.get_chat(ch)
             numeric_id = chat.id
             _resolved_channel_ids[str(ch)] = numeric_id
+            if chat.username:
+                url = f"https://t.me/{chat.username}"
+            else:
+                invite_link = getattr(chat, "invite_link", None)
+                ch_str = str(ch).lstrip("@")
+                url = invite_link or (str(ch) if str(ch).startswith("http") else f"https://t.me/{ch_str}")
+            _required_channel_info[str(ch)] = {
+                "title": chat.title or "Required Channel",
+                "url": url,
+            }
             logger.info(f"Resolved channel {ch} -> {numeric_id}")
         except Exception as e:
             logger.error(f"Failed to resolve channel {ch}: {e}")
@@ -41,6 +52,18 @@ async def resolve_required_channels(client):
 def get_resolved_ids() -> list:
     """Return list of resolved numeric channel IDs."""
     return list(_resolved_channel_ids.values())
+
+
+def get_required_channel_info(config_name) -> dict:
+    """Return cached title/url metadata for a required channel."""
+    info = _required_channel_info.get(str(config_name))
+    if info:
+        return info
+    ch_str = str(config_name).lstrip("@")
+    return {
+        "title": "Required Channel",
+        "url": str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}",
+    }
 
 
 def channel_key(channel_id) -> str:
@@ -131,7 +154,7 @@ async def get_missing_channels(user_id: int) -> list:
     return missing
 
 
-async def live_check_and_sync(client, user_id: int) -> list:
+async def live_check_and_sync(client, user_id: int, use_cache: bool = True) -> list:
     """
     Checks ALL required channels via live Telegram API for this user.
     Called on every /start and every 'I Joined' button press.
@@ -154,14 +177,13 @@ async def live_check_and_sync(client, user_id: int) -> list:
 
     # Check cache — skip 2 API calls if checked recently
     import time as _time
-    cached = _verification_cache.get(user_id)
+    cached = _verification_cache.get(user_id) if use_cache and _VERIFICATION_TTL > 0 else None
     if cached:
         result, ts = cached
         if _time.time() - ts < _VERIFICATION_TTL:
             return result
 
-    still_missing = []
-    for config_name, numeric_id in _resolved_channel_ids.items():
+    async def check_one(config_name, numeric_id):
         try:
             member = await client.get_chat_member(numeric_id, user_id)
             is_in = member.status in {
@@ -170,23 +192,27 @@ async def live_check_and_sync(client, user_id: int) -> list:
                 ChatMemberStatus.OWNER
             }
             if is_in:
-                # Confirmed in — write/update DB record
                 user = member.user
                 username = user.username or "" if user else ""
                 full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() if user else ""
-                await record_join(user_id, numeric_id, username, full_name)
-            else:
-                # Confirmed out — handle as leave (increments count if was member)
-                await _handle_detected_leave(user_id, numeric_id)
-                still_missing.append((config_name, numeric_id))
-        except UserNotParticipant:
-            # Definitely not in — handle as left
+                existing_member = await db.channel_members.find_one({
+                    "user_id": user_id,
+                    "channel_id": channel_key(numeric_id),
+                    "status": "member"
+                }, {"_id": 1})
+                if not existing_member:
+                    await record_join(user_id, numeric_id, username, full_name)
+                return None
+
             await _handle_detected_leave(user_id, numeric_id)
-            still_missing.append((config_name, numeric_id))
+            return (config_name, numeric_id)
+        except UserNotParticipant:
+            await _handle_detected_leave(user_id, numeric_id)
+            return (config_name, numeric_id)
         except FloodWait as e:
             logger.warning(f"FloodWait {e.value}s during live_check for {user_id}")
             await asyncio.sleep(e.value)
-            still_missing.append((config_name, numeric_id))
+            return (config_name, numeric_id)
         except Exception as e:
             logger.warning(f"live_check_and_sync error for {user_id} in {numeric_id}: {e}")
             doc = await db.channel_members.find_one({
@@ -195,17 +221,19 @@ async def live_check_and_sync(client, user_id: int) -> list:
                 "status": "member"
             })
             if not doc:
-                still_missing.append((config_name, numeric_id))
+                return (config_name, numeric_id)
+            return None
 
-    # Cache result
-    import time as _time
+    results = await asyncio.gather(*(
+        check_one(config_name, numeric_id)
+        for config_name, numeric_id in _resolved_channel_ids.items()
+    ))
+    still_missing = [result for result in results if result]
     _verification_cache[user_id] = (still_missing, _time.time())
-    # Evict old entries to prevent unbounded growth
     if len(_verification_cache) > 5000:
         oldest = sorted(_verification_cache, key=lambda k: _verification_cache[k][1])[:1000]
         for k in oldest:
             _verification_cache.pop(k, None)
-
     return still_missing
 
 
@@ -219,6 +247,7 @@ async def _handle_detected_leave(user_id: int, numeric_id: int):
     """
     key = channel_key(numeric_id)
     now = datetime.now()
+    _verification_cache.pop(user_id, None)
 
     existing = await db.channel_members.find_one({"user_id": user_id, "channel_id": key})
 
@@ -285,6 +314,7 @@ async def record_join(user_id: int, channel_id: int, username: str = "", full_na
 
 
 async def record_leave(user_id: int, channel_id: int, username: str = "", full_name: str = "") -> dict:
+    _verification_cache.pop(user_id, None)
     now = datetime.now()
     key = channel_key(channel_id)
     await db.channel_members.update_one(

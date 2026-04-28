@@ -4,15 +4,36 @@ from pyrogram.types import InlineQuery, InlineQueryResultArticle, InputTextMessa
 from bot.services.search import search_drama
 from bot.utils.ids import normalize_show_slug
 import asyncio
+import time
 from bot.utils.logger import logger, track_performance
 from bot.utils.behavior import track_behavior
+
+_inline_search_state = {}
+_INLINE_MIN_CHARS = 3
 
 @track_performance("inline_search_handler")
 async def inline_search_handler(client: Client, inline_query: InlineQuery):
     """Universal inline search handler."""
     query = (inline_query.query or "").strip()
-    if not query:
+    if not query or len(query) < _INLINE_MIN_CHARS:
         return await inline_query.answer([], cache_time=5, is_personal=True)
+
+    user_id = inline_query.from_user.id
+    now = time.time()
+    last_query, last_ts = _inline_search_state.get(user_id, ("", 0))
+    if now - last_ts > 300:
+        last_query = ""
+
+    same_typing_run = query.startswith(last_query) or last_query.startswith(query)
+    if same_typing_run and last_query and abs(len(query) - len(last_query)) < _INLINE_MIN_CHARS:
+        return await inline_query.answer([], cache_time=1, is_personal=True)
+
+    _inline_search_state[user_id] = (query, now)
+    if len(_inline_search_state) > 5000:
+        stale_before = now - 300
+        for uid, (_, ts) in list(_inline_search_state.items()):
+            if ts < stale_before:
+                _inline_search_state.pop(uid, None)
     
     try:
         results = await search_drama(query, limit=20)

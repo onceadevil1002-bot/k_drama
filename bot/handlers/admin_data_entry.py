@@ -1,20 +1,18 @@
-import logging
 import asyncio
 import re
 import time
 from datetime import datetime
+from typing import Optional
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from pyrogram.errors import FloodWait
 
-from bot.config import ADMIN_IDS, STORAGE_CHANNEL_ID
+from bot.config import ADMIN_IDS
 from bot.database.mongo import db
 from bot.services.shows import get_cached_data
 from bot.utils.ui import safe_answer, normalize_season
-from bot.utils.ids import normalize_show_slug, make_id, resolve_id
+from bot.utils.ids import resolve_id
 from bot.utils.logger import logger, track_performance
-from bot.utils.backup import trigger_backup
-from bot.utils.slug import normalize_slug, find_show_in_data
+from bot.utils.slug import find_show_in_data
 from bot.services.updates import add_recent_update
 
 # --- CONFIG & MAPS ---
@@ -74,7 +72,7 @@ poster_upload_state = {}
 _STATE_TTL = 600  # 10 minutes — stale states are silently discarded
 
 
-def _get_state(state_dict: dict, user_id: int) -> dict | None:
+def _get_state(state_dict: dict, user_id: int) -> Optional[dict]:
     """Return state only if it exists and is not stale (< 10 min old)."""
     state = state_dict.get(user_id)
     if not state:
@@ -299,7 +297,7 @@ async def handle_import_receive(client: Client, message: Message):
         from bot.utils.cache import show_cache
         show_cache.clear()
 
-        await safe_answer(message, f"✅ Saved **{state['show']}** S{season.replace('season_', '')} E{ep_idx+1} ({quality}{part_msg}) successfully!")
+        await proc.edit(f"✅ Saved **{state['show']}** S{season.replace('season_', '')} E{ep_idx+1} ({quality}{part_msg}) successfully!")
         
         # Log recent update
         asyncio.create_task(add_recent_update(category, show_name, season, ep_idx + 1))

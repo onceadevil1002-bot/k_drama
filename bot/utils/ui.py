@@ -163,7 +163,7 @@ async def update_media_or_text(message: Message, text: str, reply_markup=None):
         else:
             await message.edit_text(text=text, reply_markup=reply_markup)
     except Exception as e:
-        logger.debug(f"update_media_or_text: primary edit failed ({e}), trying reply fallback")
+        logger.warning(f"update_media_or_text: primary edit FAILED ({type(e).__name__}: {e}), trying reply fallback")
         # Fallback if editing fails (e.g. caption too long or message type mismatch)
         try:
             await message.reply(text, reply_markup=reply_markup)

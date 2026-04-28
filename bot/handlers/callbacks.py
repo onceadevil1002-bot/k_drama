@@ -1,8 +1,9 @@
 import logging
 import asyncio
-from pyrogram import Client, filters
+from pyrogram import filters
+from pyrogram.client import Client
 from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.errors import MessageNotModified, QueryIdInvalid, FloodWait, RPCError
+from pyrogram.errors import MessageNotModified, FloodWait
 
 from bot.utils.ui import main_keyboard, auto_delete_message, safe_answer, update_media_or_text
 from bot.utils.ids import make_id, resolve_id, normalize_show_slug
@@ -568,7 +569,7 @@ async def back_to_main_handler(client, callback_query: CallbackQuery):
     except Exception as e:
         logger.debug(f"back_to_main_handler error: {e}")
 
-from bot.services.verification import is_member_in_all_channels, get_missing_channels, live_check_and_sync
+from bot.services.verification import get_missing_channels, live_check_and_sync
 from bot.handlers.user_cmds import _build_join_buttons
 
 async def joined_handler(client: Client, callback_query: CallbackQuery):
@@ -581,7 +582,7 @@ async def joined_handler(client: Client, callback_query: CallbackQuery):
     
     if missing:
         logger.info(f"User {user_id} has missing channels, calling live_check_and_sync")
-        missing = await live_check_and_sync(client, user_id)
+        missing = await live_check_and_sync(client, user_id, use_cache=False)
         logger.debug(f"live_check_and_sync returned {len(missing)} missing channels")
     
     if missing:

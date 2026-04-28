@@ -2,13 +2,13 @@ import asyncio
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from bot.config import ADMIN_IDS, REQUIRED_CHANNELS
+from bot.config import ADMIN_IDS
 from bot.utils.ui import reply_with_ui, main_keyboard, safe_answer
 from bot.services.verification import (
-    is_banned, get_ban_doc,
+    is_banned,
     is_member_in_all_channels, get_missing_channels,
     live_check_and_sync, get_leave_count, is_warned,
-    set_warned, ban_user
+    set_warned, ban_user, get_required_channel_info
 )
 from bot.services.favorites import get_user_favorites
 from bot.services.updates import get_recent_updates, get_formatted_recent_updates
@@ -23,31 +23,10 @@ async def _build_join_buttons(client, missing_channels: list) -> list:
     """
     buttons = []
     logger.debug(f"_build_join_buttons called with {len(missing_channels)} missing channels")
-    
-    for config_name, numeric_id in missing_channels:
-        try:
-            lookup = numeric_id if numeric_id is not None else config_name
-            logger.debug(f"Getting chat info for {config_name} (lookup={lookup})")
-            chat = await client.get_chat(lookup)
-            title = chat.title or "Required Channel"
-            if chat.username:
-                url = f"https://t.me/{chat.username}"
-            else:
-                url = getattr(chat, "invite_link", None)
-                if not url:
-                    ch_str = str(config_name).lstrip("@")
-                    url = str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}"
-            logger.debug(f"Created button for {title} with url {url}")
-            buttons.append([InlineKeyboardButton(f"📢 Join {title}", url=url)])
-        except Exception as e:
-            logger.warning(f"Failed to get chat info for {config_name}: {e}")
-            ch_str = str(config_name).lstrip("@")
-            url = str(config_name) if str(config_name).startswith("http") else f"https://t.me/{ch_str}"
-            logger.debug(f"Using fallback url {url}")
-            buttons.append([InlineKeyboardButton(f"📢 Join Channel", url=url)])
-    
-    buttons.append([InlineKeyboardButton("✅ I Joined", callback_data="joined")])
-    logger.debug(f"Returning {len(buttons)} button rows")
+    for config_name, _numeric_id in missing_channels:
+        info = get_required_channel_info(config_name)
+        buttons.append([InlineKeyboardButton(f"Join {info['title']}", url=info["url"])])
+    buttons.append([InlineKeyboardButton("I Joined", callback_data="joined")])
     return buttons
 
 async def _gate_check(client, user_id: int, reply_fn) -> bool:
@@ -91,7 +70,6 @@ async def _gate_check(client, user_id: int, reply_fn) -> bool:
         if leave_count >= 4:
             # Check if already banned (may have been banned mid-session)
             if not await is_banned(user_id):
-                from pyrogram.errors import RPCError
                 try:
                     tg_user = await client.get_users(user_id)
                     username = tg_user.username or ""
