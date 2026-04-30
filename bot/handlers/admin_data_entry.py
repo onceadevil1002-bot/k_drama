@@ -8,11 +8,11 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 
 from bot.config import ADMIN_IDS
 from bot.database.mongo import db
-from bot.services.shows import get_cached_data
+from bot.services.shows import _LEGACY_CATEGORY_MAP, get_cached_data
 from bot.utils.ui import safe_answer, normalize_season
 from bot.utils.ids import resolve_id
 from bot.utils.logger import logger, track_performance
-from bot.utils.slug import find_show_in_data
+from bot.utils.slug import find_show_in_data, normalize_slug
 from bot.services.updates import add_recent_update
 
 # --- CONFIG & MAPS ---
@@ -70,6 +70,73 @@ import_state = {}
 poster_upload_state = {}
 
 _STATE_TTL = 600  # 10 minutes — stale states are silently discarded
+
+
+def _category_variants(category: str) -> list[str]:
+    """Return DB category names that should be treated as this canonical category."""
+    variants = {category}
+    variants.update(old for old, canonical in _LEGACY_CATEGORY_MAP.items() if canonical == category)
+    return list(variants)
+
+
+async def _find_show_for_admin_action(data: dict, category: str, show_input: str) -> str | None:
+    """Find a show in cached normalized data, then fall back to raw DB category variants."""
+    actual_show_name = find_show_in_data(data, category, show_input)
+    if actual_show_name:
+        return actual_show_name
+
+    query_slug = normalize_slug(show_input)
+    cursor = db.shows.find(
+        {"category": {"$in": _category_variants(category)}},
+        {"show_name": 1}
+    )
+    async for doc in cursor:
+        show_name = doc.get("show_name", "")
+        if normalize_slug(show_name) == query_slug:
+            return show_name
+
+    return None
+
+
+def _parse_delete_tail(tokens: list[str]) -> tuple[str | None, int | None, str | None] | None:
+    """Parse optional season/episode/quality tokens after a resolved show name."""
+    parts = tokens[:]
+    quality = None
+    if parts and parts[-1].lower() in ["480p", "720p", "1080p", "4k"]:
+        quality = parts.pop().lower()
+
+    if not parts:
+        return (None, None, None) if quality is None else None
+
+    season_number = None
+    episode_num = None
+    if len(parts) == 1:
+        token = parts[0]
+        if token.isdigit():
+            season_number = token
+        elif token.lower().startswith("s") and token[1:].isdigit():
+            season_number = token[1:]
+        else:
+            return None
+    elif len(parts) == 2:
+        season_token, episode_token = parts
+        if season_token.isdigit():
+            season_number = season_token
+        elif season_token.lower().startswith("s") and season_token[1:].isdigit():
+            season_number = season_token[1:]
+        else:
+            return None
+
+        if not episode_token.isdigit():
+            return None
+        episode_num = int(episode_token)
+    else:
+        return None
+
+    if quality and not (season_number and episode_num):
+        return None
+
+    return season_number, episode_num, quality
 
 
 def _get_state(state_dict: dict, user_id: int) -> Optional[dict]:
@@ -510,44 +577,35 @@ async def delete_command_handler(client: Client, message: Message):
             f"• `/{cmd} Show Name 1 2 720p` (Delete S1 E2 720p)"
         )
 
-    parts = args_text.split()
-    
-    quality = None
-    if parts[-1].lower() in ["480p", "720p", "1080p", "4k"]:
-        quality = parts.pop().lower()
-        
-    episode_num = None
-    if parts and parts[-1].isdigit():
-        episode_num = int(parts.pop())
-        
-    season_number = None
-    if parts and parts[-1].isdigit():
-        season_number = parts.pop()
-    elif parts and parts[-1].lower().startswith("s") and parts[-1][1:].isdigit():
-        season_number = parts.pop()[1:]
-    
-    show_name_input = " ".join(parts).strip()
-    if episode_num is not None and season_number is None and quality is None:
-        season_number = str(episode_num)
-        episode_num = None
-
     data = await get_cached_data()
-    actual_show_name = find_show_in_data(data, category, show_name_input)
-    
-    # Fallback: query DB directly in case cache is stale
-    if not actual_show_name:
-        db_doc = await db.shows.find_one(
-            {"category": category, "show_name": {"$regex": f"^{re.escape(show_name_input.replace('_', ' '))}$", "$options": "i"}},
-            {"show_name": 1}
-        )
-        if db_doc:
-            actual_show_name = db_doc["show_name"]
+    tokens = args_text.split()
+    actual_show_name = None
+    show_name_input = args_text
+    season_number = None
+    episode_num = None
+    quality = None
+
+    for split_at in range(len(tokens), 0, -1):
+        candidate_show = " ".join(tokens[:split_at]).strip()
+        parsed_tail = _parse_delete_tail(tokens[split_at:])
+        if parsed_tail is None:
+            continue
+
+        matched_show = await _find_show_for_admin_action(data, category, candidate_show)
+        if matched_show:
+            actual_show_name = matched_show
+            show_name_input = candidate_show
+            season_number, episode_num, quality = parsed_tail
+            break
 
     if not actual_show_name:
         return await message.reply(f"❌ Show '{show_name_input}' not found in {category}.")
 
     # Logic to delete
-    doc = await db.shows.find_one({"category": category, "show_name": actual_show_name})
+    doc = await db.shows.find_one({
+        "category": {"$in": _category_variants(category)},
+        "show_name": actual_show_name
+    })
     if not doc:
         return await message.reply(f"❌ Show missing in DB.")
 
