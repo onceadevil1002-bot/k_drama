@@ -2,7 +2,7 @@ import logging
 import asyncio
 import time
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 
 from bot.config import ADMIN_IDS, STORAGE_CHANNEL_ID
@@ -36,9 +36,23 @@ async def stats_cmd(client: Client, message: Message):
         group_res = await db.userdb.aggregate(group_pipeline).to_list(1)
         total_groups = group_res[0]["total"] if group_res else 0
         
+        # Total chow count (sum of all interaction counts)
+        user_pipeline = [
+            {"$group": {"_id": None, "total_interactions": {"$sum": "$interaction_count"}}}
+        ]
+        chow_res = await db.userdb.aggregate(user_pipeline).to_list(1)
+        total_chow = chow_res[0]["total_interactions"] if chow_res else 0
+        
         # Totals
         total_favs = await db.favorites.count_documents({})
         total_reports = await db.reports.count_documents({})
+        unresolved_reports = await db.reports.count_documents({"status": {"$ne": "resolved", "$ne": "rejected"}})
+        
+        # Get 10 latest unresolved reports
+        unresolved_cursor = db.reports.find(
+            {"status": {"$nin": ["resolved", "rejected"]}}
+        ).sort("created_at", -1).limit(10)
+        unresolved_list = await unresolved_cursor.to_list(10)
         
         # Top 10 Favorites
         fav_pipeline = [
@@ -55,16 +69,48 @@ async def stats_cmd(client: Client, message: Message):
         msg += f"├ Private Chats: {private_users}\n"
         msg += f"└ Groups: {total_groups}\n\n"
         msg += f"⭐ **Total Favorites**: {total_favs}\n"
-        msg += f"⚠️ **Total Reports**: {total_reports}\n\n"
+        msg += f"⚠️ **Total Reports**: {total_reports} ({unresolved_reports} unresolved)\n"
+        msg += f"📺 **Total Chow**: {total_chow}\n\n"
         
+        # Add top favorites
         if top_favs:
             msg += "🔥 **Top 10 Most Favorited:**\n"
             for idx, item in enumerate(top_favs, 1):
                 name = item["_id"].get("show_name", "Unknown")
                 cat = item["_id"].get("category", "N/A")
                 msg += f"{idx}. {name} ({cat}) - ⭐ {item['count']}\n"
+        
+        # Add latest unresolved reports
+        if unresolved_list:
+            msg += f"\n🚩 **Latest {len(unresolved_list)} Unresolved Reports:**\n"
+            buttons = []
+            for idx, report in enumerate(unresolved_list[:10], 1):
+                report_id = str(report.get("_id"))
+                user_info = report.get("user", {})
+                report_text = str(report.get("report", "N/A"))[:40]  # Truncate to 40 chars
+                status = report.get("status", "pending")
                 
-        await message.reply(msg)
+                msg += f"{idx}. **[{status.upper()}]** {report_text}... (User: {user_info.get('full_name', 'Unknown')})\n"
+                
+                # Add inline button for this report
+                buttons.append([InlineKeyboardButton(
+                    f"Report {idx}: {report_text[:20]}...",
+                    callback_data=f"view_report|{report_id}"
+                )])
+            
+            # Send main stats message first
+            await message.reply(msg)
+            
+            # Send reports list with buttons
+            reports_msg = f"📋 **Access Unresolved Reports** ({len(unresolved_list)} total)\n\n"
+            reports_msg += "Click on any report to view full details:"
+            await message.reply(
+                reports_msg,
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+        else:
+            await message.reply(msg)
+            
     except Exception as e:
         logger.exception(f"stats_cmd error: {e}")
         await message.reply("❌ Error fetching statistics.")
@@ -322,6 +368,41 @@ async def unban_cmd(client: Client, message: Message):
         await message.reply("❌ Error processing unban.")
 
 
+async def view_report_cb(client: Client, callback_query: CallbackQuery):
+    """Handle viewing a specific report from stats."""
+    try:
+        from bson import ObjectId
+        report_id = callback_query.data.split("|")[1]
+        
+        # Convert string to ObjectId if necessary
+        if isinstance(report_id, str):
+            report_id = ObjectId(report_id)
+        
+        report = await db.reports.find_one({"_id": report_id})
+        if not report:
+            return await safe_answer(callback_query, "❌ Report not found.", show_alert=True)
+        
+        user_info = report.get("user", {})
+        report_text = report.get("report", "N/A")
+        status = report.get("status", "pending")
+        created_at = report.get("created_at", "N/A")
+        
+        msg = (
+            f"🚩 **Report Details**\n\n"
+            f"👤 **From:** {user_info.get('full_name', 'Unknown')} (`{user_info.get('user_id')}`)\n"
+            f"📝 **Report:** {report_text}\n"
+            f"🚦 **Status:** {status.upper()}\n"
+            f"⏰ **Created:** {created_at}\n"
+            f"🆔 ID: `{report_id}`"
+        )
+        
+        await callback_query.message.reply(msg)
+        await safe_answer(callback_query)
+    except Exception as e:
+        logger.exception(f"view_report_cb error: {e}")
+        await safe_answer(callback_query, "❌ Error loading report.", show_alert=True)
+
+
 def register_admin_handlers(app: Client):
     app.on_message(filters.command("stats") & admin_filter & filters.private)(stats_cmd)
     app.on_message(filters.command("broadcast") & admin_filter & filters.private)(broadcast_cmd)
@@ -330,3 +411,4 @@ def register_admin_handlers(app: Client):
     app.on_message(filters.command("set_sticker") & admin_filter & filters.private)(set_sticker_cmd)
     app.on_message(filters.command("banned_list") & admin_filter & filters.private)(banned_list_cmd)
     app.on_message(filters.command("unban") & admin_filter & filters.private)(unban_cmd)
+    app.on_callback_query(filters.regex(r"^view_report\|") & admin_filter)(view_report_cb)

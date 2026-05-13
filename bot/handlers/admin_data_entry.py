@@ -673,7 +673,7 @@ async def get_link_cmd(client: Client, message: Message):
 
 @track_performance("user_search_cmd")
 async def user_search_cmd(client: Client, message: Message):
-    """Advanced user search by ID, Username, or Name."""
+    """Advanced user search by ID, Username, or Name with detailed profile info."""
     if len(message.command) < 2:
         return await message.reply("Usage: /user_search ID or @username or Name")
     
@@ -699,10 +699,43 @@ async def user_search_cmd(client: Client, message: Message):
         return await message.reply("❌ No users found matching that query.")
     
     for u in users:
-        is_premium = u.get("is_premium", False)
-        status_str = "Active"
         uid = u['user_id']
         
+        # Calculate activity score (same as Deep Analysis)
+        interaction_count = u.get("interaction_count", 0)
+        last_interaction = u.get("last_interaction")
+        days_since_last = 999
+        if last_interaction:
+            days_since_last = (datetime.now() - last_interaction).days
+        if days_since_last <= 1:
+            activity_score = min(100, interaction_count * 2)
+        elif days_since_last <= 7:
+            activity_score = min(100, interaction_count)
+        elif days_since_last <= 30:
+            activity_score = min(50, interaction_count // 2)
+        else:
+            activity_score = min(10, interaction_count // 10)
+
+        # Calculate preferred category
+        categories = u.get("categories_browsed", [])
+        preferred_category = (
+            max(categories, key=lambda x: x.get("count", 0))["category"]
+            if categories else "N/A"
+        )
+
+        # Browse to watch ratio
+        shows_opened = len(u.get("shows_opened", []))
+        episodes_watched = len(u.get("episodes_watched", []))
+        if shows_opened > 0:
+            bw_ratio = f"{episodes_watched}/{shows_opened}"
+        else:
+            bw_ratio = "N/A"
+
+        # Favorites and reports count
+        total_favorites = await db.favorites.count_documents({"user_id": uid})
+        total_reports = await db.reports.count_documents({"user.user_id": uid})
+
+        # Format dates
         last_online = u.get("last_interaction", None)
         if hasattr(last_online, "strftime"):
             last_online = last_online.strftime("%Y-%m-%d %H:%M")
@@ -715,25 +748,54 @@ async def user_search_cmd(client: Client, message: Message):
         else:
             first_seen = "N/A"
 
+        # Peak hour calculation
+        timestamps = u.get("interaction_timestamps", [])
+        peak_hour = "N/A"
+        if timestamps:
+            hour_counts = {}
+            for ts in timestamps:
+                h = ts.hour if hasattr(ts, "hour") else 0
+                hour_counts[h] = hour_counts.get(h, 0) + 1
+            peak_hour = f"{max(hour_counts, key=hour_counts.get):02d}:00"
+
+        # Status flags
+        flags = []
+        if u.get("is_premium"): flags.append("💎 Premium")
+        if u.get("is_verified"): flags.append("✅ Verified")
+        if u.get("is_scam"): flags.append("⚠️ SCAM")
+        if u.get("is_fake"): flags.append("⚠️ FAKE")
+        if u.get("warned"): flags.append("🔶 Warned")
+        flags_text = " | ".join(flags) if flags else "None"
+
         groups_count = len([c for c in u.get("chats", []) if "PRIVATE" not in str(c.get("type", ""))])
-        interaction_count = u.get("interaction_count", 0)
         dc_id = u.get("dc_id", "?")
-        is_verified = u.get("is_verified", False)
-        is_scam = u.get("is_scam", False)
+        
+        # Search queries summary
+        searches = u.get("search_queries", [])
+        recent_searches = ", ".join([s.get("query", "") for s in searches[-5:]]) if searches else "None"
 
         text = (
-            f"👤 **USER MAX-PROFILE**\n"
+            f"🧠 **DEEP ANALYSIS - USER SEARCH**\n\n"
             f"🆔 ID: `{uid}`\n"
             f"👤 Name: {u.get('full_name', 'Unknown')}\n"
             f"📛 Username: @{u.get('username') or 'None'}\n"
-            f"🌐 Lang: {u.get('language_code', '?')} | DC: {dc_id}\n"
-            f"💎 Premium: {'✅' if is_premium else '❌'} | "
-            f"Verified: {'✅' if is_verified else '❌'} | "
-            f"Scam: {'⚠️' if is_scam else '❌'}\n\n"
-            f"📊 Interactions: {interaction_count}\n"
-            f"🏢 Known Groups: {groups_count}\n"
-            f"📅 First Seen: {first_seen}\n"
-            f"⏱ Last Online: {last_online}\n"
+            f"🌐 Language: {u.get('language_code', '?')} | DC: {dc_id}\n"
+            f"🏷 Flags: {flags_text}\n\n"
+            f"📊 **Activity**\n"
+            f"├ Score: {activity_score}/100\n"
+            f"├ Interactions: {interaction_count}\n"
+            f"├ First Seen: {first_seen}\n"
+            f"├ Last Seen: {last_online}\n"
+            f"└ Peak Hour: {peak_hour}\n\n"
+            f"🎬 **Content Behaviour**\n"
+            f"├ Preferred Category: {preferred_category}\n"
+            f"├ Browse→Watch: {bw_ratio}\n"
+            f"├ Favorites: {total_favorites}\n"
+            f"├ Reports Filed: {total_reports}\n"
+            f"└ Recent Searches: {recent_searches}\n\n"
+            f"🌐 **Social**\n"
+            f"├ Common Chats: {groups_count}\n"
+            f"└ Known Groups: {len(u.get('chats', []))}"
         )
         
         btns = []

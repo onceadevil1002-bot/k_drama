@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 # State for users waiting to type a report
 report_waiting = {} # user_id -> context
 
+# State for admins waiting to send message to reporter
+report_reply_waiting = {} # user_id -> {report_id, report_target_user_id}
+
 async def report_command(client: Client, message: Message):
     """Initiate a report for a specific show/category."""
     user_id = message.from_user.id
@@ -105,6 +108,9 @@ async def handle_report_text(client: Client, message: Message):
                         InlineKeyboardButton("❌ Reject", callback_data=f"report_status|{report_id}|rejected")
                     ],
                     [
+                        InlineKeyboardButton("💬 Send Msg", callback_data=f"report_send_msg|{report_id}|{user_id}"),
+                    ],
+                    [
                         InlineKeyboardButton("👤 More from User", callback_data=f"report_view_user|{user_id}"),
                         InlineKeyboardButton("🔍 Same Show", callback_data=f"report_search_show|{report_data['show_name']}")
                     ]
@@ -149,17 +155,70 @@ async def report_status_handler(client: Client, callback_query: CallbackQuery):
                 await client.send_message(user_target_id, msg)
             except Exception as e:
                 logger.warning(f"Could not notify user {user_target_id} of report status update: {e}")
-            
-        await callback_query.message.edit_text(f"✅ Report {new_status.capitalize()}")
-        await safe_answer(callback_query, f"Report {new_status}")
+        
+        # Only delete the report from admin chat if resolved or rejected
+        if new_status in ["resolved", "rejected"]:
+            await callback_query.message.delete()
+            await safe_answer(callback_query, f"✅ Report {new_status.capitalize()} and deleted")
+        else:
+            # For processing, just show confirmation without deleting
+            await safe_answer(callback_query, f"✅ Report marked as {new_status.capitalize()}")
     else:
         await safe_answer(callback_query, "Failed to update report.", show_alert=True)
+
+async def report_send_msg_handler(client: Client, callback_query: CallbackQuery):
+    """Handle 'Send Message' button - initiates message sending flow."""
+    parts = callback_query.data.split("|")
+    report_id = parts[1]
+    target_user_id = int(parts[2])
+    admin_id = callback_query.from_user.id
+    
+    # Store the context for this admin
+    report_reply_waiting[admin_id] = {
+        "report_id": report_id,
+        "target_user_id": target_user_id
+    }
+    
+    await callback_query.message.reply(
+        f"📝 **Sending message to reporter** (User ID: {target_user_id})\n\n"
+        f"Please type your message below 👇\n"
+        f"This message will be sent directly to the user who filed the report."
+    )
+    await safe_answer(callback_query)
+
+async def handle_report_reply_text(client: Client, message: Message):
+    """Handle the actual message text sent by admin to reporter."""
+    admin_id = message.from_user.id
+    if admin_id not in report_reply_waiting:
+        return
+    
+    context = report_reply_waiting.pop(admin_id)
+    reply_text = message.text.strip()
+    
+    if not reply_text:
+        return await message.reply("❌ Message cancelled (empty text).")
+    
+    target_user_id = context["target_user_id"]
+    
+    try:
+        # Send message to the reporter
+        response_msg = (
+            f"📩 **Response from Admin**\n\n"
+            f"{reply_text}"
+        )
+        await client.send_message(target_user_id, response_msg)
+        await message.reply(f"✅ **Message sent to user {target_user_id}**")
+        logger.info(f"Admin {admin_id} sent response to report user {target_user_id}")
+    except Exception as e:
+        await message.reply(f"❌ Failed to send message: {e}")
+        logger.error(f"Failed to send report response to user {target_user_id}: {e}")
 
 def register_report_handlers(app: Client):
     app.on_message(filters.command("report") & filters.private)(report_command)
     app.on_callback_query(filters.regex(r"^report$"))(report_main_cb)
     app.on_callback_query(filters.regex(r"^report\|"))(report_callback_handler)
     app.on_callback_query(filters.regex(r"^report_status\|"))(report_status_handler)
+    app.on_callback_query(filters.regex(r"^report_send_msg\|"))(report_send_msg_handler)
     # CRITICAL: Must be group=1, NOT group=0.
     # handle_import_receive in admin_data_entry.py is registered at group=0 for ALL private
     # text messages. In Pyrogram, only the first matching handler per group fires.
@@ -169,3 +228,7 @@ def register_report_handlers(app: Client):
         filters.text & filters.private & ~filters.regex(r"^/"),
         group=1
     )(handle_report_text)
+    app.on_message(
+        filters.text & filters.private & ~filters.regex(r"^/"),
+        group=2
+    )(handle_report_reply_text)
