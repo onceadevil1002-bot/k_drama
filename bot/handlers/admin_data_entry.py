@@ -223,22 +223,27 @@ async def import_command_handler(client: Client, message: Message):
     quality = match.group(4) + "p" if not match.group(4).endswith("p") else match.group(4)
     part_num = int(match.group(5)) if match.group(5) else None
 
-    # Validate Show and Category
-    data = await get_cached_data()
-    if category not in data:
-        # Try finding by alias
+    # Validate Show and Category — direct DB query, no full cache load
+    show_doc_check = await db.shows.find_one(
+        {"category": category, "show_name": {"$regex": f"^{re.escape(show_name_input)}$", "$options": "i"}},
+        {"show_name": 1}
+    )
+    if not show_doc_check:
+        # Try alias categories
         alias_cat = CATEGORY_ALIASES.get(category.lower())
-        if alias_cat: category = alias_cat
-        else: return await message.reply(f"❌ Category {category} not found.")
-
-    # Find show (flexible matching as in monolith)
-    actual_show_name = find_show_in_data(data, category, show_name_input)
-
-    if not actual_show_name:
-        return await message.reply(
-            f"❌ Show '{show_name_input}' not found in {category}.\n"
-            f"💡 **Tip:** Use `/add` to create it first."
-        )
+        if alias_cat:
+            show_doc_check = await db.shows.find_one(
+                {"category": alias_cat, "show_name": {"$regex": f"^{re.escape(show_name_input)}$", "$options": "i"}},
+                {"show_name": 1}
+            )
+            if show_doc_check:
+                category = alias_cat
+        if not show_doc_check:
+            return await message.reply(
+                f"❌ Show '{show_name_input}' not found in {category}.\n"
+                f"💡 **Tip:** Use `/add` to create it first."
+            )
+    actual_show_name = show_doc_check["show_name"]
 
     season_key = normalize_season(season_str)
     
@@ -360,9 +365,12 @@ async def handle_import_receive(client: Client, message: Message):
             {"$set": {f"episodes.{season}": episodes}}
         )
 
-        # Clear cache
-        from bot.utils.cache import show_cache
-        show_cache.clear()
+        # Targeted cache invalidation — only drop this specific show from L2.
+        # L1 (category show list) is NOT touched — the show still exists,
+        # only its episode content changed.
+        from bot.utils.cache import layered_cache
+        from bot.utils.ids import normalize_show_slug
+        layered_cache.invalidate_show(normalize_show_slug(show_name))
 
         await proc.edit(f"✅ Saved **{state['show']}** S{season.replace('season_', '')} E{ep_idx+1} ({quality}{part_msg}) successfully!")
         
@@ -389,9 +397,12 @@ async def add_poster_command(client: Client, message: Message):
     except IndexError:
         return await message.reply(f"**Usage:** `/{cmd} <Show Name>`")
 
-    data = await get_cached_data()
-    actual_show = find_show_in_data(data, category, show_input)
-    
+    # Direct DB query — no full cache load
+    show_doc_check = await db.shows.find_one(
+        {"category": category, "show_name": {"$regex": f"^{re.escape(show_input)}$", "$options": "i"}},
+        {"show_name": 1}
+    )
+    actual_show = show_doc_check["show_name"] if show_doc_check else None
     if not actual_show:
         return await message.reply(f"❌ Show '{show_input}' not found in {category}.")
 
@@ -465,8 +476,9 @@ async def handle_poster_receive(client: Client, message: Message):
             {"$set": {"poster": current_posters}}
         )
 
-        from bot.utils.cache import show_cache
-        show_cache.clear()
+        from bot.utils.cache import layered_cache
+        from bot.utils.ids import normalize_show_slug
+        layered_cache.invalidate_show(normalize_show_slug(state["show"]))
 
         await proc.edit(f"✅ Poster added for **{state['show']}**!")
 
@@ -552,9 +564,12 @@ async def add_show_cmd(client: Client, message: Message):
             else:
                 await message.reply(f"ℹ️ Season {season_key} already exists for **{show_name}**.")
 
-        # Clear cache
-        from bot.utils.cache import show_cache
-        show_cache.clear()
+        from bot.utils.cache import layered_cache
+        from bot.utils.ids import normalize_show_slug
+        # New show added — invalidate L1 so the category list refreshes
+        layered_cache.invalidate_category(category)
+        # Also drop L2 for this show if it was somehow cached already
+        layered_cache.invalidate_show(normalize_show_slug(show_name))
         
     except Exception as e:
         logger.exception(f"Add show error: {e}")
@@ -577,7 +592,10 @@ async def delete_command_handler(client: Client, message: Message):
             f"• `/{cmd} Show Name 1 2 720p` (Delete S1 E2 720p)"
         )
 
-    data = await get_cached_data()
+    # Build minimal data dict for _find_show_for_admin_action using L1 cache
+    from bot.services.shows import get_category_shows
+    _cat_shows = await get_category_shows(category)
+    data = {category: {s["show_name"]: {} for s in _cat_shows}}
     tokens = args_text.split()
     actual_show_name = None
     show_name_input = args_text
@@ -619,7 +637,7 @@ async def delete_command_handler(client: Client, message: Message):
                 del ep["qualities"][quality]
                 episodes[ep_idx] = ep
                 await db.shows.update_one({"_id": doc["_id"]}, {"$set": {f"episodes.{season_key}": episodes}})
-                from bot.utils.cache import show_cache; show_cache.clear()
+                from bot.utils.cache import layered_cache; from bot.utils.ids import normalize_show_slug; layered_cache.invalidate_show(normalize_show_slug(actual_show_name))
                 return await message.reply(f"✅ Deleted **{quality}** from **S{season_key} E{episode_num}** of **{actual_show_name}**.")
         return await message.reply("❌ Quality/Episode not found.")
 
@@ -630,7 +648,7 @@ async def delete_command_handler(client: Client, message: Message):
         if ep_idx < len(episodes):
             episodes.pop(ep_idx)
             await db.shows.update_one({"_id": doc["_id"]}, {"$set": {f"episodes.{season_key}": episodes}})
-            from bot.utils.cache import show_cache; show_cache.clear()
+            from bot.utils.cache import layered_cache; from bot.utils.ids import normalize_show_slug; layered_cache.invalidate_show(normalize_show_slug(actual_show_name))
             return await message.reply(f"✅ Deleted **S{season_key} E{episode_num}** from **{actual_show_name}**.")
         return await message.reply("❌ Episode not found.")
         
@@ -638,13 +656,13 @@ async def delete_command_handler(client: Client, message: Message):
         season_key = str(int(season_number))
         if season_key in doc.get("episodes", {}):
             await db.shows.update_one({"_id": doc["_id"]}, {"$unset": {f"episodes.{season_key}": ""}})
-            from bot.utils.cache import show_cache; show_cache.clear()
+            from bot.utils.cache import layered_cache; from bot.utils.ids import normalize_show_slug; layered_cache.invalidate_show(normalize_show_slug(actual_show_name))
             return await message.reply(f"✅ Deleted **Season {season_key}** from **{actual_show_name}**.")
         return await message.reply("❌ Season not found.")
 
     res = await db.shows.delete_one({"_id": doc["_id"]})
     if res.deleted_count:
-        from bot.utils.cache import show_cache; show_cache.clear()
+        from bot.utils.cache import layered_cache; from bot.utils.ids import normalize_show_slug; layered_cache.invalidate_category(category); layered_cache.invalidate_show(normalize_show_slug(actual_show_name))
         return await message.reply(f"✅ Deleted entire show **{actual_show_name}** from {category}.")
     await message.reply("❌ Delete failed.")
 

@@ -158,7 +158,8 @@ async def recent_updates_cmd(client: Client, message: Message):
 from bot.services.favorites import is_favorited
 from bot.services.search import search_drama
 
-from bot.services.shows import get_cached_data
+from bot.services.shows import get_category_shows, _LEGACY_CATEGORY_MAP
+from bot.database.mongo import db
 from bot.services.users import upsert_user, get_watch_history
 from bot.services.requests import submit_request
 from bot.utils.ui import show_loading_sticker
@@ -254,26 +255,36 @@ async def start_cmd(client: Client, message: Message):
         try:
             category_part, show_part = param.split("__", 1)
             category_key = category_part.replace("_", " ").lower().strip()
-            data = await get_cached_data()
+
+            # Resolve category: query DB distinct values, normalize to canonical name
+            raw_categories = await db.shows.distinct("category")
             matched_category = None
-            for c in data:
-                if c.lower().strip() == category_key:
-                    matched_category = c
+            for c in raw_categories:
+                canonical = _LEGACY_CATEGORY_MAP.get(c, c)
+                if canonical.lower().strip() == category_key:
+                    matched_category = canonical
                     break
+
             if matched_category:
                 decoded_show_name = decode_show_slug(show_part).strip()
+                # Fetch show list for this category from L1 cache
+                cat_data = await get_category_shows(matched_category)
+                all_show_names = [item["show_name"] for item in cat_data]
+
                 matched_show = None
-                for db_show in data[matched_category]:
-                    if db_show.lower() == decoded_show_name.lower():
-                        matched_show = db_show
+                lower = decoded_show_name.lower()
+                for name in all_show_names:
+                    if name.lower() == lower:
+                        matched_show = name
                         break
                 if not matched_show:
-                    for db_show in data[matched_category]:
-                        if decoded_show_name.lower() in db_show.lower():
-                            matched_show = db_show
+                    for name in all_show_names:
+                        if lower in name.lower():
+                            matched_show = name
                             break
+
                 if matched_show:
-                    shows = sorted(data[matched_category].keys())
+                    shows = sorted(all_show_names)
                     if matched_show in shows:
                         shows.remove(matched_show)
                     shows.insert(0, matched_show)

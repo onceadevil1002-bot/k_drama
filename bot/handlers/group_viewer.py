@@ -4,7 +4,7 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from bot.utils.ui import safe_answer, main_keyboard
 from bot.utils.ids import make_id, resolve_id
-from bot.services.shows import get_cached_data
+from bot.services.shows import get_category_shows  # noqa: F401 — reserved for future group browsing
 from bot.services.sessions import create_group_session, get_group_session
 
 logger = logging.getLogger(__name__)
