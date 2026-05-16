@@ -1,6 +1,6 @@
 import logging
 from bot.database.mongo import db
-from bot.utils.cache import layered_cache
+from bot.utils.cache import layered_cache, _make_show_cache_key
 from bot.utils.ids import normalize_show_slug
 
 logger = logging.getLogger(__name__)
@@ -13,7 +13,8 @@ async def update_poster(category, show_name, file_ids):
             {"show_name": show_name, "category": category},
             {"$set": {"poster": file_ids}}
         )
-        layered_cache.invalidate_show(normalize_show_slug(show_name))
+        cache_key = _make_show_cache_key(category, normalize_show_slug(show_name))
+        layered_cache.invalidate_show(cache_key)
         return result.matched_count > 0
     except Exception as e:
         logger.error(f"Error updating poster: {e}")
@@ -38,7 +39,8 @@ async def add_episode(category, show_name, season_number, episode_data):
             update = {"$push": {"episodes.episodes": episode_data}}
 
         await db.shows.update_one(query, update)
-        layered_cache.invalidate_show(normalize_show_slug(show_name))
+        cache_key = _make_show_cache_key(category, normalize_show_slug(show_name))
+        layered_cache.invalidate_show(cache_key)
         return True, "✅ Episode added."
     except Exception as e:
         logger.error(f"Error adding episode: {e}")
@@ -71,7 +73,8 @@ async def convert_to_split(category, show_name, season_number, episode_num):
             {"category": category, "show_name": show_name},
             {"$set": {f"episodes.{key}.{idx}": new_entry}}
         )
-        layered_cache.invalidate_show(normalize_show_slug(show_name))
+        cache_key = _make_show_cache_key(category, normalize_show_slug(show_name))
+        layered_cache.invalidate_show(cache_key)
         return True, "✅ Converted to split."
     except Exception as e:
         logger.error(f"Error converting to split: {e}")
