@@ -98,23 +98,25 @@ async def get_show_detail(category: str, show_name: str) -> dict | None:
     from bot.utils.ids import normalize_show_slug
 
     slug = normalize_show_slug(show_name)
+    # Include category in cache key to differentiate same show in different categories
+    cache_key = f"{category}:{slug}"
 
-    if layered_cache.needs_background_refresh(slug):
-        asyncio.create_task(_background_refresh_show(category, show_name, slug))
+    if layered_cache.needs_background_refresh(cache_key):
+        asyncio.create_task(_background_refresh_show(category, show_name, cache_key))
 
     return await layered_cache.get_show(
-        slug,
+        cache_key,
         loader_fn=lambda: load_show_detail(category, show_name)
     )
 
 
-async def _background_refresh_show(category: str, show_name: str, slug: str):
+async def _background_refresh_show(category: str, show_name: str, cache_key: str):
     """Silently refresh a show's L2 cache entry before it expires."""
     from bot.utils.cache import layered_cache
     try:
         fresh_data = await load_show_detail(category, show_name)
         if fresh_data:
-            layered_cache.set_show(slug, fresh_data)
+            layered_cache.set_show(cache_key, fresh_data)
             logger.debug(f"Background refresh complete for '{show_name}'")
     except Exception as e:
         logger.debug(f"Background refresh failed for '{show_name}': {e}")

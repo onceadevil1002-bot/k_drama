@@ -9,6 +9,12 @@ logger = logging.getLogger(__name__)
 verify_cache = TTLCache(maxsize=50000, ttl=3600)
 
 
+# ── Helper for composite cache keys ────────────────────────────────────────────
+def _make_show_cache_key(category: str, show_slug: str) -> str:
+    """Generate cache key that includes category to differentiate same show in different categories."""
+    return f"{category}:{show_slug}"
+
+
 # ── NEW: Layered Cache ─────────────────────────────────────────────────────────
 
 class LayeredCache:
@@ -20,7 +26,7 @@ class LayeredCache:
          Used for: showing the show list when a user clicks a category button.
 
     L2 — Show Detail     (TTL: 1 hour)
-         Stores: { show_slug → full show document from MongoDB }
+         Stores: { category:show_slug → full show document from MongoDB }
          Used for: showing seasons, episodes, qualities, and file IDs.
 
     Rules:
@@ -28,6 +34,7 @@ class LayeredCache:
     - Episode imports → invalidate_show() only.
     - Show added/deleted → invalidate_category() + invalidate_show().
     - Stampede protection: asyncio.Lock per cache key.
+    - Cache key for L2 includes category to differentiate same show across categories.
     """
 
     def __init__(self):
@@ -35,7 +42,7 @@ class LayeredCache:
         self._l1: TTLCache = TTLCache(maxsize=20, ttl=600)
         self._l1_lock = asyncio.Lock()
 
-        # L2: show_slug → full show document
+        # L2: category:show_slug → full show document
         self._l2: TTLCache = TTLCache(maxsize=2000, ttl=3600)
         self._l2_locks: dict = {}
 
@@ -66,38 +73,38 @@ class LayeredCache:
 
     # ── L2 methods ─────────────────────────────────────────────────────────────
 
-    def _get_l2_lock(self, slug: str) -> asyncio.Lock:
-        if slug not in self._l2_locks:
-            self._l2_locks[slug] = asyncio.Lock()
-        return self._l2_locks[slug]
+    def _get_l2_lock(self, cache_key: str) -> asyncio.Lock:
+        if cache_key not in self._l2_locks:
+            self._l2_locks[cache_key] = asyncio.Lock()
+        return self._l2_locks[cache_key]
 
-    async def get_show(self, slug: str, loader_fn) -> dict | None:
-        if slug in self._l2:
-            return self._l2[slug]
+    async def get_show(self, cache_key: str, loader_fn) -> dict | None:
+        if cache_key in self._l2:
+            return self._l2[cache_key]
 
-        lock = self._get_l2_lock(slug)
+        lock = self._get_l2_lock(cache_key)
         async with lock:
-            if slug in self._l2:
-                return self._l2[slug]
+            if cache_key in self._l2:
+                return self._l2[cache_key]
 
-            logger.debug(f"LayeredCache L2 miss: loading show '{slug}' from DB")
+            logger.debug(f"LayeredCache L2 miss: loading show '{cache_key}' from DB")
             data = await loader_fn()
             if data is not None:
-                self._l2[slug] = data
-                self._l2_loaded_at[slug] = time.time()
+                self._l2[cache_key] = data
+                self._l2_loaded_at[cache_key] = time.time()
             return data
 
-    def set_show(self, slug: str, data: dict):
-        self._l2[slug] = data
-        self._l2_loaded_at[slug] = time.time()
+    def set_show(self, cache_key: str, data: dict):
+        self._l2[cache_key] = data
+        self._l2_loaded_at[cache_key] = time.time()
 
-    def invalidate_show(self, slug: str):
-        self._l2.pop(slug, None)
-        self._l2_loaded_at.pop(slug, None)
-        logger.debug(f"LayeredCache L2 invalidated: show '{slug}'")
+    def invalidate_show(self, cache_key: str):
+        self._l2.pop(cache_key, None)
+        self._l2_loaded_at.pop(cache_key, None)
+        logger.debug(f"LayeredCache L2 invalidated: show '{cache_key}'")
 
-    def needs_background_refresh(self, slug: str, refresh_before_seconds: int = 300) -> bool:
-        loaded_at = self._l2_loaded_at.get(slug)
+    def needs_background_refresh(self, cache_key: str, refresh_before_seconds: int = 300) -> bool:
+        loaded_at = self._l2_loaded_at.get(cache_key)
         if loaded_at is None:
             return False
         age = time.time() - loaded_at
