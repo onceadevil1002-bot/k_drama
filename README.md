@@ -2,6 +2,8 @@
 
 A Pyrogram-based Telegram bot for browsing and managing drama content with inline navigation, deep links, admin upload tools, required-channel verification, reports, favorites, history, and profile/admin utilities.
 
+#K Drama
+#K-Drama
 ## Features
 
 ### User Features
